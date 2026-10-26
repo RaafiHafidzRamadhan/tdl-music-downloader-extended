@@ -4,3 +4,4 @@ aiofiles>=23.1.0
 mutagen>=1.46.0
 imageio-ffmpeg>=0.4.9
 Pillow>=10.0.0
+yt-dlp>=2025.1.0

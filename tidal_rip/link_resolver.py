@@ -11,7 +11,6 @@ def is_external_music_link(text):
         return False
     t = text.strip().lower()
     return any(domain in t for domain in [
-        "spotify.com", "open.spotify.com", "spotify:", "spotify.link", "spoti.fi",
         "music.apple.com", "itunes.apple.com", "apple.co",
         "youtube.com", "youtu.be", "music.youtube.com",
         "deezer.com", "deezer.page.link",
@@ -39,7 +38,7 @@ def clean_music_title(title):
     return t
 
 def follow_redirects_sync(url):
-    """Follows HTTP redirects (e.g. mobile shortlinks like spotify.link, apple.co) to the destination URL."""
+    """Follows HTTP redirects from mobile shortlinks to the destination URL."""
     try:
         req = urllib.request.Request(
             url,
@@ -61,78 +60,18 @@ async def resolve_external_link(url):
     """
     url = url.strip()
 
-    # Follow mobile shortlink redirects (spotify.link, apple.co, deezer.page.link, etc.)
+    # Follow mobile shortlink redirects (apple.co, deezer.page.link, etc.)
     shortlink_domains = [
-        "spotify.link", "spoti.fi", "apple.co", "deezer.page.link",
+        "apple.co", "deezer.page.link",
         "on.soundcloud.com", "a.co", "amzn.to"
     ]
     if any(d in url.lower() for d in shortlink_domains):
         url = await asyncio.to_thread(follow_redirects_sync, url)
     
     # -------------------------------------------------------------
-    # 1. SPOTIFY
-    # -------------------------------------------------------------
-    if "spotify.com" in url or url.startswith("spotify:"):
-        # Normalize spotify URI: spotify:track:xxx -> https://open.spotify.com/track/xxx
-        if url.startswith("spotify:"):
-            parts = url.split(":")
-            if len(parts) >= 3:
-                url = f"https://open.spotify.com/{parts[1]}/{parts[2]}"
-
-        # Remove query parameters for cleaner scraping
-        clean_url = url.split("?")[0]
-        
-        req = urllib.request.Request(
-            clean_url,
-            headers={'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)'}
-        )
-        def fetch_spotify():
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.read().decode('utf-8', errors='ignore')
-                
-        try:
-            html_content = await asyncio.to_thread(fetch_spotify)
-            title_m = re.search(r'<meta (?:property|name)="og:title" content="([^"]+)"', html_content)
-            desc_m = re.search(r'<meta (?:property|name)="og:description" content="([^"]+)"', html_content)
-            
-            raw_title = html.unescape(title_m.group(1)) if title_m else ""
-            raw_desc = html.unescape(desc_m.group(1)) if desc_m else ""
-            
-            # Split description by middle dot, bullet, hyphen, etc.
-            parts = [p.strip() for p in re.split(r'[\xb7\u2022\u2027\u2219\u25cf\u25cb\-\|]', raw_desc) if p.strip()]
-            
-            if "/track/" in clean_url:
-                artist = parts[0] if parts else ""
-                clean_track = clean_music_title(raw_title)
-                query = f"{artist} {clean_track}".strip()
-                return query, "tracks", f"Spotify Track: {clean_track} by {artist}", "Spotify"
-                
-            elif "/album/" in clean_url:
-                artist = ""
-                by_m = re.search(r" - (?:Album|Single|EP) by (.*?) \| Spotify", raw_title, re.I)
-                if by_m:
-                    artist = by_m.group(1).strip()
-                elif parts:
-                    artist = parts[0]
-                clean_album = re.sub(r" - (?:Album|Single|EP) by .*? \| Spotify", "", raw_title, flags=re.I).strip()
-                clean_album = re.sub(r" \| Spotify", "", clean_album, flags=re.I).strip()
-                query = f"{artist} {clean_album}".strip()
-                return query, "albums", f"Spotify Album: {clean_album} by {artist}", "Spotify"
-                
-            elif "/playlist/" in clean_url:
-                clean_pl = re.sub(r" \| Spotify", "", raw_title, flags=re.I).strip()
-                return clean_pl, "playlists", f"Spotify Playlist: {clean_pl}", "Spotify"
-                
-            elif "/artist/" in clean_url:
-                clean_artist = re.sub(r" \| Spotify", "", raw_title, flags=re.I).strip()
-                return clean_artist, "artists", f"Spotify Artist: {clean_artist}", "Spotify"
-        except Exception as e:
-            print(f"Spotify link resolution error: {e}")
-
-    # -------------------------------------------------------------
     # 2. APPLE MUSIC / ITUNES
     # -------------------------------------------------------------
-    elif "music.apple.com" in url or "itunes.apple.com" in url:
+    if "music.apple.com" in url or "itunes.apple.com" in url:
         track_match = re.search(r"[?&]i=(\d+)", url)
         album_match = re.search(r"/album/(?:[^/]+/)?(\d+)", url)
         slug_match = re.search(r"/(?:album|song|artist)/([^/]+)/(\d+)", url)

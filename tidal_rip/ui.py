@@ -1,773 +1,526 @@
-import os
-import time
+"""Main application window: navigation shell, login, previews, and session state."""
+
 import asyncio
-import threading
-import webbrowser
-import re
+import glob
 import io
+import json
+import os
 import subprocess
-import winsound
-import customtkinter as CTk
-from tkinter import filedialog, messagebox
-from .downloader import DownloadManager
+import threading
+import time
+import urllib.parse
+from tkinter import messagebox
+
 import aiohttp
-from PIL import Image
+import customtkinter as CTk
 import imageio_ffmpeg
-from .link_resolver import is_external_music_link, resolve_external_link
+from PIL import Image
 
-CTk.set_appearance_mode("dark")
-CTk.set_default_color_theme("blue")
+from .components import (
+    chip_label,
+    format_specs,
+    ghost_button,
+    open_browser,
+    open_in_file_manager,
+    primary_button,
+    soft_button,
+)
+from .downloader import DownloadManager
+from .player_views import PlayerViewMixin
+from .queue_views import QueueViewMixin
+from .search_views import SearchViewMixin
+from .settings_views import SettingsViewMixin
+from .theme import COLORS, SOURCE_META, setup_theme, source_meta, ui_font
+from .widgets import rounded_image, truncate_middle
+from .youtube_service import YouTubeService
 
-# Custom colors for Tidal theme
-COLOR_ACCENT = "#00e5ff"       # Tidal Cyan
-COLOR_ACCENT_HOVER = "#00b8d4" # Darker Cyan
-COLOR_DARK_BG = "#121212"      # Black
-COLOR_FRAME_BG = "#1e1e1e"     # Dark Grey
-COLOR_TEXT_MUTED = "#aaaaaa"   # Light Grey
-
-def register_browsers():
-    import platform
-    if platform.system() != "Windows":
-        return
-        
-    import winreg
-    
-    browser_keys = {
-        "chrome": ["chrome", "google-chrome", "google chrome"],
-        "firefox": ["firefox", "mozilla firefox"],
-        "edge": ["edge", "microsoft edge", "msedge"],
-        "opera": ["opera", "opera beta", "opera stable"]
-    }
-    
-    registered = set()
-    
-    # 1. Search in Windows Registry for installed browsers
-    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-        try:
-            key_path = r"SOFTWARE\Clients\StartMenuInternet"
-            with winreg.OpenKey(root, key_path) as key:
-                num_subkeys = winreg.QueryInfoKey(key)[0]
-                for i in range(num_subkeys):
-                    subkey_name = winreg.EnumKey(key, i)
-                    try:
-                        shell_path = f"{key_path}\\{subkey_name}\\shell\\open\\command"
-                        with winreg.OpenKey(root, shell_path) as path_key:
-                            val = winreg.QueryValue(path_key, None)
-                            if val:
-                                path = val.strip('"')
-                                if path.lower().endswith(' %1'):
-                                    path = path[:-3].strip('"')
-                                if os.path.exists(path):
-                                    sub_lower = subkey_name.lower()
-                                    matched_key = None
-                                    for k, aliases in browser_keys.items():
-                                        if any(alias in sub_lower for alias in aliases):
-                                            matched_key = k
-                                            break
-                                    
-                                    if matched_key and matched_key not in registered:
-                                        webbrowser.register(matched_key, None, webbrowser.BackgroundBrowser(path))
-                                        registered.add(matched_key)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    # 2. Fallback to common hardcoded paths
-    local_app_data = os.environ.get("LOCALAPPDATA", "")
-    program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
-    program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
-    
-    common = {
-        "chrome": [
-            os.path.join(program_files, "Google\\Chrome\\Application\\chrome.exe"),
-            os.path.join(program_files_x86, "Google\\Chrome\\Application\\chrome.exe"),
-            os.path.join(local_app_data, "Google\\Chrome\\Application\\chrome.exe")
-        ],
-        "firefox": [
-            os.path.join(program_files, "Mozilla Firefox\\firefox.exe"),
-            os.path.join(program_files_x86, "Mozilla Firefox\\firefox.exe")
-        ],
-        "edge": [
-            os.path.join(program_files_x86, "Microsoft\\Edge\\Application\\msedge.exe"),
-            os.path.join(program_files, "Microsoft\\Edge\\Application\\msedge.exe")
-        ],
-        "opera": [
-            os.path.join(local_app_data, "Programs\\Opera\\launcher.exe"),
-            os.path.join(program_files, "Opera\\launcher.exe"),
-            os.path.join(program_files_x86, "Opera\\launcher.exe")
-        ]
-    }
-    
-    for name, paths in common.items():
-        if name in registered:
-            continue
-        for path in paths:
-            if os.path.exists(path):
-                try:
-                    webbrowser.register(name, None, webbrowser.BackgroundBrowser(path))
-                    registered.add(name)
-                    break
-                except Exception:
-                    pass
-
-# Run browser registration on load
-register_browsers()
-
-def open_browser(url, browser_name):
-    if not browser_name or browser_name == "Default Browser":
-        webbrowser.open(url)
-        return
-        
-    mapping = {
-        "Google Chrome": "chrome",
-        "Mozilla Firefox": "firefox",
-        "Microsoft Edge": "edge",
-        "Safari": "safari",
-        "Opera": "opera"
-    }
-    
-    key = mapping.get(browser_name)
-    if key:
-        try:
-            b = webbrowser.get(key)
-            b.open(url)
-        except Exception as e:
-            print(f"Failed to open specific browser {browser_name}: {e}. Falling back to default.")
-            webbrowser.open(url)
-    else:
-        webbrowser.open(url)
-
-def open_in_file_manager(path, select_file=False):
-    """Opens a directory or highlights a file in Windows Explorer / OS file manager safely."""
-    if not path:
-        return False
-    try:
-        norm_path = os.path.normpath(str(path))
-        if not os.path.exists(norm_path):
-            parent = os.path.dirname(norm_path)
-            if os.path.exists(parent):
-                norm_path = parent
-                select_file = False
-            else:
-                return False
-                
-        import platform
-        sys_name = platform.system()
-        if sys_name == "Windows":
-            if select_file and os.path.isfile(norm_path):
-                subprocess.Popen(["explorer.exe", f"/select,{norm_path}"])
-            else:
-                target_dir = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
-                subprocess.Popen(["explorer.exe", target_dir])
-        elif sys_name == "Darwin":
-            if select_file and os.path.isfile(norm_path):
-                subprocess.Popen(["open", "-R", norm_path])
-            else:
-                target_dir = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
-                subprocess.Popen(["open", target_dir])
-        else:
-            target_dir = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
-            subprocess.Popen(["xdg-open", target_dir])
-        return True
-    except Exception as e:
-        print(f"Failed to open file manager: {e}")
-        return False
-
-def parse_tidal_url(query):
-    """Parses track, album, playlist, or artist/singer links from Tidal, including raw playlist UUIDs."""
-    query = query.strip()
-    
-    # Check for raw UUID (custom user playlist ID)
-    uuid_pattern = r"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
-    uuid_match = re.search(uuid_pattern, query)
-    if uuid_match:
-        return "playlist", uuid_match.group(1)
-        
-    patterns = {
-        "track": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?(?:album/\d+/)?track/(\d+)",
-        "album": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?album/(\d+)",
-        "playlist": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?playlist/([a-zA-Z0-9-]+)",
-        "artist": r"tidal\.com/(?:[a-z]+/)?(?:browse/)?artist/(\d+)"
-    }
-    for item_type, pattern in patterns.items():
-        match = re.search(pattern, query)
-        if match:
-            return item_type, match.group(1)
-            
-    # Also support raw digits as track ID if query is purely numeric
-    if query.isdigit() and len(query) >= 5:
-        return "track", query
-        
-    return None, None
-
-class LoginModal(CTk.CTkToplevel):
-    """Modal dialog displaying the OAuth device verification link and code."""
-    
-    def __init__(self, parent, verification_uri, user_code):
-        super().__init__(parent)
-        self.title("Tidal Login Verification")
-        self.geometry("450x300")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
-        
-        # Center window
-        self.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
-        self.geometry(f"+{x}+{y}")
-        
-        self.configure(fg_color=COLOR_DARK_BG)
-        
-        title_label = CTk.CTkLabel(self, text="TIDAL DEVICE LOGIN", font=CTk.CTkFont(size=18, weight="bold"), text_color=COLOR_ACCENT)
-        title_label.pack(pady=(20, 10))
-        
-        instr_label = CTk.CTkLabel(
-            self, 
-            text="Please open the link below and enter the verification code on Tidal:",
-            font=CTk.CTkFont(size=12),
-            wraplength=400
-        )
-        instr_label.pack(pady=10)
-        
-        # Code Display Box
-        code_frame = CTk.CTkFrame(self, fg_color=COLOR_FRAME_BG, border_color=COLOR_ACCENT, border_width=1)
-        code_frame.pack(pady=10, padx=20, fill="x")
-        
-        self.code_label = CTk.CTkLabel(code_frame, text=user_code, font=CTk.CTkFont(size=28, weight="bold", family="Courier"))
-        self.code_label.pack(pady=10)
-        
-        # Buttons
-        btn_frame = CTk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(pady=20)
-        
-        copy_btn = CTk.CTkButton(
-            btn_frame, 
-            text="Copy Code", 
-            fg_color=COLOR_FRAME_BG, 
-            hover_color="#333333", 
-            text_color="white",
-            border_color=COLOR_ACCENT,
-            border_width=1,
-            width=120,
-            command=lambda: self.copy_code(user_code)
-        )
-        copy_btn.pack(side="left", padx=10)
-        
-        open_btn = CTk.CTkButton(
-            btn_frame, 
-            text="Open Link", 
-            fg_color=COLOR_ACCENT, 
-            hover_color=COLOR_ACCENT_HOVER, 
-            text_color="black",
-            width=120,
-            command=lambda: self.open_link(verification_uri)
-        )
-        open_btn.pack(side="left", padx=10)
-        
-        self.status_label = CTk.CTkLabel(self, text="Waiting for authorization...", text_color=COLOR_TEXT_MUTED, font=CTk.CTkFont(size=11, slant="italic"))
-        self.status_label.pack(pady=(0, 10))
-
-    def copy_code(self, code):
-        self.clipboard_clear()
-        self.clipboard_append(code)
-        self.status_label.configure(text="Code copied to clipboard!", text_color=COLOR_ACCENT)
-
-    def open_link(self, url):
-        browser_name = self.master.config.login_browser
-        open_browser(url, browser_name)
-        self.status_label.configure(text="Link opened in browser!", text_color=COLOR_ACCENT)
+try:
+    import winsound
+except ImportError:  # pragma: no cover - Windows is the primary target
+    winsound = None
 
 
-def format_specs(bit_depth, sample_rate, audio_quality="", audio_mode="STEREO"):
-    """Formats bit depth and sample rate into accurate dynamic badge text and color."""
-    if audio_mode == "DOLBY_ATMOS" or "ATMOS" in str(audio_mode).upper():
-        return "🔊 Dolby Atmos", "#9c27b0"
-    
-    sr_str = ""
-    if sample_rate:
-        sr_khz = sample_rate / 1000.0
-        sr_str = f"{sr_khz:g}kHz"
-    
-    if bit_depth and bit_depth >= 24:
-        text = f"🎵 MAX • {bit_depth}-bit/{sr_str}" if sr_str else f"🎵 MAX • {bit_depth}-bit"
-        return text, "#ffb300"
-    elif bit_depth == 16:
-        text = f"💿 HiFi • 16-bit/{sr_str}" if sr_str else "💿 HiFi • 16-bit/44.1kHz"
-        return text, "#1976d2"
-    elif "HIRES" in str(audio_quality).upper() or "HI_RES" in str(audio_quality).upper():
-        return "🎵 MAX (24-bit Hi-Res)", "#ffb300"
-    elif "LOSSLESS" in str(audio_quality).upper():
-        return "💿 HiFi (16-bit Lossless)", "#1976d2"
-    else:
-        return "Standard (AAC)", "#616161"
+setup_theme()
+
+SOURCE_ORDER = ("tidal", "youtube")
+SOURCE_ICONS = {"tidal": "≈", "youtube": "▶"}
+NAV_ITEMS = {
+    "search": ("⌕", "Search"),
+    "queue": ("↓", "Downloads"),
+    "player": ("♫", "Player"),
+    "settings": ("⚙", "Settings"),
+}
 
 
-def get_quality_badge(item):
-    """Returns initial (badge_text, badge_color) based on item's audioQuality, audioModes, and mediaMetadata tags."""
-    media_meta = item.get("mediaMetadata", {})
-    tags = media_meta.get("tags", []) if isinstance(media_meta, dict) else []
-    audio_quality = item.get("audioQuality", "")
-    audio_modes = item.get("audioModes", [])
-    
-    if "DOLBY_ATMOS" in audio_modes or "DOLBY_ATMOS" in tags:
-        return "🔊 Dolby Atmos", "#9c27b0"
-    elif "HIRES_LOSSLESS" in tags or audio_quality == "HI_RES_LOSSLESS":
-        return "🎵 MAX (24-bit Hi-Res)", "#ffb300"
-    elif "MQA" in tags:
-        return "🎵 MQA (Master)", "#00e5ff"
-    elif "LOSSLESS" in tags or audio_quality == "LOSSLESS":
-        return "💿 HiFi (16-bit/44.1kHz)", "#1976d2"
-    elif audio_quality in ("HIGH", "LOW"):
-        return "Standard (AAC)", "#616161"
-    return "", "#333333"
+class AppUI(SearchViewMixin, QueueViewMixin, PlayerViewMixin, SettingsViewMixin, CTk.CTk):
+    """Main window: top source selector, sidebar library controls, and shared queue."""
 
-
-class TrackSelectionModal(CTk.CTkToplevel):
-    """Modal dialog allowing users to pick which tracks to download from an album or playlist."""
-    
-    def __init__(self, parent, collection_type, collection_title, track_list, on_confirm_callback):
-        super().__init__(parent)
-        self.parent = parent
-        self.collection_type = collection_type
-        self.collection_title = collection_title
-        self.track_list = track_list
-        self.on_confirm = on_confirm_callback
-        self.check_vars = []  # list of (trk_dict, BooleanVar)
-        
-        self.title(f"Select Tracks — {collection_title}")
-        self.geometry("680x600")
-        self.minsize(540, 440)
-        self.transient(parent)
-        self.grab_set()
-        self.configure(fg_color=COLOR_DARK_BG)
-        
-        # Center over parent
-        self.update_idletasks()
-        try:
-            x = parent.winfo_x() + (parent.winfo_width() - 680) // 2
-            y = parent.winfo_y() + (parent.winfo_height() - 600) // 2
-            self.geometry(f"+{max(0, x)}+{max(0, y)}")
-        except Exception:
-            pass
-            
-        self._build_ui()
-
-    def _build_ui(self):
-        # Header frame
-        header = CTk.CTkFrame(self, fg_color=COLOR_FRAME_BG, corner_radius=10)
-        header.pack(fill="x", padx=20, pady=(20, 10))
-        
-        title_lbl = CTk.CTkLabel(
-            header,
-            text=self.collection_title,
-            font=CTk.CTkFont(size=16, weight="bold"),
-            text_color="white",
-            anchor="w",
-            justify="left"
-        )
-        title_lbl.pack(fill="x", padx=16, pady=(12, 2))
-        
-        sub_text = f"{self.collection_type} • {len(self.track_list)} tracks available • Choose tracks to add to queue"
-        sub_lbl = CTk.CTkLabel(
-            header,
-            text=sub_text,
-            font=CTk.CTkFont(size=12),
-            text_color=COLOR_TEXT_MUTED,
-            anchor="w",
-            justify="left"
-        )
-        sub_lbl.pack(fill="x", padx=16, pady=(0, 12))
-        
-        # Toolbar
-        toolbar = CTk.CTkFrame(self, fg_color="transparent")
-        toolbar.pack(fill="x", padx=20, pady=(5, 10))
-        
-        btn_all = CTk.CTkButton(
-            toolbar,
-            text="☑ Select All",
-            width=100,
-            height=30,
-            fg_color=COLOR_FRAME_BG,
-            hover_color="#333333",
-            border_color="#444444",
-            border_width=1,
-            font=CTk.CTkFont(size=11, weight="bold"),
-            command=self.select_all
-        )
-        btn_all.pack(side="left", padx=(0, 8))
-        
-        btn_none = CTk.CTkButton(
-            toolbar,
-            text="☐ Deselect All",
-            width=110,
-            height=30,
-            fg_color=COLOR_FRAME_BG,
-            hover_color="#333333",
-            border_color="#444444",
-            border_width=1,
-            font=CTk.CTkFont(size=11),
-            command=self.deselect_all
-        )
-        btn_none.pack(side="left", padx=(0, 8))
-
-        btn_invert = CTk.CTkButton(
-            toolbar,
-            text="🔄 Invert",
-            width=80,
-            height=30,
-            fg_color=COLOR_FRAME_BG,
-            hover_color="#333333",
-            border_color="#444444",
-            border_width=1,
-            font=CTk.CTkFont(size=11),
-            command=self.invert_selection
-        )
-        btn_invert.pack(side="left")
-        
-        self.count_lbl = CTk.CTkLabel(
-            toolbar,
-            text="",
-            font=CTk.CTkFont(size=12, weight="bold"),
-            text_color=COLOR_ACCENT
-        )
-        self.count_lbl.pack(side="right", padx=5)
-        
-        # Scrollable track listing
-        scroll_frame = CTk.CTkScrollableFrame(self, fg_color=COLOR_FRAME_BG, corner_radius=10)
-        scroll_frame.pack(fill="both", expand=True, padx=20, pady=(0, 15))
-        
-        # Check if multiple discs present
-        has_multiple_discs = any(t.get("disc_num", 1) > 1 for t in self.track_list)
-        
-        for idx, trk in enumerate(self.track_list):
-            row = CTk.CTkFrame(scroll_frame, fg_color="transparent", height=40)
-            row.pack(fill="x", pady=2, padx=4)
-            row.pack_propagate(False)
-            
-            var = CTk.BooleanVar(value=True)
-            self.check_vars.append((trk, var))
-            
-            cb = CTk.CTkCheckBox(
-                row,
-                text="",
-                variable=var,
-                width=24,
-                checkbox_width=20,
-                checkbox_height=20,
-                border_width=2,
-                fg_color=COLOR_ACCENT,
-                hover_color=COLOR_ACCENT_HOVER,
-                checkmark_color="black",
-                command=self.update_counter
-            )
-            cb.pack(side="left", padx=(8, 12))
-            
-            # Disc / Track number
-            if has_multiple_discs and trk.get("disc_num"):
-                num_text = f"{trk['disc_num']}-{trk.get('track_num', idx+1):02d}"
-            else:
-                num_text = f"{trk.get('track_num', idx+1):02d}"
-                
-            num_lbl = CTk.CTkLabel(
-                row,
-                text=num_text,
-                font=CTk.CTkFont(family="Consolas", size=11),
-                text_color=COLOR_TEXT_MUTED,
-                width=35,
-                anchor="w"
-            )
-            num_lbl.pack(side="left", padx=(0, 8))
-            
-            # Duration (packed to right FIRST so it is never displaced by long titles)
-            if trk.get("duration_str"):
-                dur_lbl = CTk.CTkLabel(
-                    row,
-                    text=trk["duration_str"],
-                    font=CTk.CTkFont(family="Consolas", size=11),
-                    text_color=COLOR_TEXT_MUTED,
-                    width=45,
-                    anchor="e"
-                )
-                dur_lbl.pack(side="right", padx=(5, 12))
-
-            # Title & artist (packed with expand=True into remaining space)
-            info_frame = CTk.CTkFrame(row, fg_color="transparent")
-            info_frame.pack(side="left", fill="both", expand=True)
-            
-            title_text = trk.get("title", "Unknown Title")
-            artist_text = trk.get("artist", "Unknown Artist")
-            
-            trk_lbl = CTk.CTkLabel(
-                info_frame,
-                text=f"{title_text}  •  {artist_text}",
-                font=CTk.CTkFont(size=12),
-                anchor="w",
-                justify="left"
-            )
-            trk_lbl.pack(side="left", fill="x", expand=True)
-                
-            # Allow clicking row text to toggle checkbox
-            def make_toggle(v=var):
-                v.set(not v.get())
-                self.update_counter()
-            trk_lbl.bind("<Button-1>", lambda e, func=make_toggle: func())
-            
-            # Subtle divider
-            if idx < len(self.track_list) - 1:
-                div = CTk.CTkFrame(scroll_frame, fg_color="#2b2b2b", height=1)
-                div.pack(fill="x", padx=10, pady=1)
-
-        # Footer action buttons
-        footer = CTk.CTkFrame(self, fg_color="transparent")
-        footer.pack(fill="x", padx=20, pady=(0, 20))
-        
-        cancel_btn = CTk.CTkButton(
-            footer,
-            text="Cancel",
-            fg_color=COLOR_FRAME_BG,
-            hover_color="#333333",
-            text_color="white",
-            border_color="#555555",
-            border_width=1,
-            width=100,
-            height=38,
-            font=CTk.CTkFont(size=12),
-            command=self.destroy
-        )
-        cancel_btn.pack(side="right", padx=(10, 0))
-        
-        self.confirm_btn = CTk.CTkButton(
-            footer,
-            text="Download Selected",
-            fg_color=COLOR_ACCENT,
-            hover_color=COLOR_ACCENT_HOVER,
-            text_color="black",
-            height=38,
-            font=CTk.CTkFont(size=13, weight="bold"),
-            command=self.confirm_selection
-        )
-        self.confirm_btn.pack(side="right")
-        
-        self.update_counter()
-
-    def select_all(self):
-        for _, var in self.check_vars:
-            var.set(True)
-        self.update_counter()
-
-    def deselect_all(self):
-        for _, var in self.check_vars:
-            var.set(False)
-        self.update_counter()
-
-    def invert_selection(self):
-        for _, var in self.check_vars:
-            var.set(not var.get())
-        self.update_counter()
-
-    def update_counter(self):
-        selected_count = sum(1 for _, var in self.check_vars if var.get())
-        total_count = len(self.check_vars)
-        self.count_lbl.configure(text=f"Selected: {selected_count} / {total_count}")
-        if selected_count == 0:
-            self.confirm_btn.configure(
-                text="Select at least 1 track",
-                state="disabled",
-                fg_color="#444444",
-                text_color="#888888"
-            )
-        else:
-            self.confirm_btn.configure(
-                text=f"Download Selected ({selected_count})",
-                state="normal",
-                fg_color=COLOR_ACCENT,
-                text_color="black"
-            )
-
-    def confirm_selection(self):
-        selected = [trk for trk, var in self.check_vars if var.get()]
-        if not selected:
-            return
-        self.destroy()
-        self.on_confirm(selected)
-
-
-class AppUI(CTk.CTk):
-    """Main Application UI class running CustomTkinter."""
-    
     def __init__(self, api, config, async_loop):
         super().__init__()
         self.api = api
         self.config = config
         self.async_loop = async_loop
         self.downloader = DownloadManager(self.api, self.config)
-        
-        self.title("Tidal Rip - HiFi Downloader")
-        self.geometry("950x600")
-        self.minsize(800, 500)
-        self.configure(fg_color=COLOR_DARK_BG)
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
-        # State variables
-        self.search_results = []
-        self.queue_items = {} # track_id -> UI elements and stats
+        self.youtube_service = YouTubeService(self.api, self.config)
+
+        self.source = "tidal"
+        self.active_view = "search"
+        self._search_gen = 0
+        self._search_busy = False
+        self._shutdown = False
+        self._closing = False
+        self.login_in_progress = False
+
+        self.queue_items = {}
         self.queue_order = []
         self.pending_downloads = []
-        
-        # Image management (B2: prevent garbage collection, O2: caching)
+
         self._image_refs = []
         self._image_cache = {}
-        self._specs_cache = {}  # track_id -> (badge_text, badge_color)
-        
-        # Preview state
+        self._specs_cache = {}
+
         self.preview_proc = None
         self.preview_tid = None
         self.active_pbtn = None
-        
-        # Create Layout
+        self._preview_gen = 0
+
+        self.init_player_state()
+
+        self.title("TDL Music — Tidal · YouTube")
+        self._fit_window()
+        self.configure(fg_color=COLORS["bg"])
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
         self.setup_layout()
-        
-        # Start ONE background worker (B3: single worker with shared semaphore)
         self.run_async(self.download_worker())
-        
-        # Check login status
         self.check_login_status()
-        
-        # Load saved session
         self.after(500, self.load_session)
 
-    def on_closing_save_session(self):
-        """Saves pending downloads to session file (called by main.py on shutdown)."""
-        try:
-            session_data = []
-            for tid in self.pending_downloads:
-                if tid in self.queue_items:
-                    item = self.queue_items[tid]
-                    session_data.append({
-                        "track_id": tid,
-                        "title": item["title"],
-                        "parent_folder": item.get("parent_folder")
-                    })
-            
-            session_file = os.path.join(self.config.config_dir, "session.json")
-            import json
-            with open(session_file, "w", encoding="utf-8") as f:
-                json.dump(session_data, f, ensure_ascii=False)
-        except Exception as e:
-            print(f"Failed to save session: {e}")
-        
-        # Clean up preview temp files
-        import glob
-        preview_dir = os.path.join(self.config.config_dir, "previews")
-        for target_dir in (self.config.download_directory, preview_dir):
-            for pattern in ("preview_*.m4a", "preview_*.wav"):
-                try:
-                    for fpath in glob.glob(os.path.join(target_dir, pattern)):
-                        os.remove(fpath)
-                except Exception:
-                    pass
-
-    def on_closing(self):
-        """Handle application close event."""
-        self.on_closing_save_session()
-        self.downloader.is_cancelled = True
-        self.destroy()
-
-    def load_session(self):
-        """Loads pending downloads from the previous session."""
-        try:
-            session_file = os.path.join(self.config.config_dir, "session.json")
-            if os.path.exists(session_file):
-                import json
-                with open(session_file, "r", encoding="utf-8") as f:
-                    session_data = json.load(f)
-                
-                if session_data:
-                    for data in session_data:
-                        self.queue_track_download(data["track_id"], data["title"], data.get("parent_folder"))
-                    
-                    import tkinter.messagebox as messagebox
-                    messagebox.showinfo("Session Restored", f"Restored {len(session_data)} pending downloads from your previous session.")
-                    
-                # Clear the file after loading
-                os.remove(session_file)
-        except Exception as e:
-            print(f"Failed to load session: {e}")
+    # ------------------------------------------------------------------ async
 
     def run_async(self, coro):
-        """Helper to run a coroutine safely in the background event loop."""
-        return asyncio.run_coroutine_threadsafe(coro, self.async_loop)
+        """Schedules a coroutine on the shared background event loop."""
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, self.async_loop)
+        except RuntimeError:
+            return None
 
-    async def load_and_set_image(self, url, image_label):
-        """Loads a thumbnail image from URL, with caching, GC protection, and safe widget checks."""
-        if not url:
+    def _focus_search(self):
+        self.switch_view("search")
+        if hasattr(self, "search_entry"):
+            self.search_entry.focus_set()
+
+    # ----------------------------------------------------------------- layout
+
+    def _fit_window(self):
+        work_width, work_height = self._work_area()
+        width = max(980, min(1240, work_width - 60))
+        height = max(600, min(760, work_height - 90))
+        x = max(0, (work_width - width) // 2)
+        y = max(0, (work_height - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.minsize(980, 600)
+
+    def _work_area(self):
+        """Returns the usable screen size in Tk units, excluding the Windows taskbar."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            rect = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(
+                0x0030, 0, ctypes.byref(rect), 0
+            ):
+                scale = float(self._get_window_scaling() or 1.0)
+                width = int(round((rect.right - rect.left) / scale))
+                height = int(round((rect.bottom - rect.top) / scale))
+                if width > 0 and height > 0:
+                    return width, height
+        except Exception:
+            pass
+        return self.winfo_screenwidth(), self.winfo_screenheight()
+
+    def setup_layout(self):
+        self.grid_rowconfigure(2, weight=1)
+        self.grid_columnconfigure(2, weight=1)
+
+        self._build_navbar()
+        CTk.CTkFrame(self, fg_color=COLORS["border"], height=1).grid(
+            row=1, column=0, columnspan=3, sticky="ew"
+        )
+        self._build_sidebar()
+        CTk.CTkFrame(self, fg_color=COLORS["border"], width=1).grid(
+            row=2, column=1, sticky="ns"
+        )
+
+        self.main_container = CTk.CTkFrame(self, fg_color="transparent")
+        self.main_container.grid(
+            row=2, column=2, sticky="nsew", padx=26, pady=(18, 22)
+        )
+        self.main_container.grid_rowconfigure(0, weight=1)
+        self.main_container.grid_columnconfigure(0, weight=1)
+
+        self.create_search_view()
+        self.create_queue_view()
+        self.create_player_view()
+        self.create_settings_view()
+
+        self.bind("<Control-f>", lambda _event: self._focus_search())
+        self.bind("<Control-Key-1>", lambda _event: self.switch_view("search"))
+        self.bind("<Control-Key-2>", lambda _event: self.switch_view("queue"))
+        self.bind("<Control-Key-3>", lambda _event: self.switch_view("player"))
+        self.bind("<Control-Key-4>", lambda _event: self.switch_view("settings"))
+
+        self.switch_view("search")
+        self.switch_source("tidal", initial=True)
+        self._display_folder()
+
+    def _build_navbar(self):
+        navbar = CTk.CTkFrame(
+            self, fg_color=COLORS["surface"], corner_radius=0, height=74
+        )
+        navbar.grid(row=0, column=0, columnspan=3, sticky="ew")
+        navbar.grid_propagate(False)
+        navbar.grid_columnconfigure(1, weight=1)
+
+        brand = CTk.CTkFrame(navbar, fg_color="transparent")
+        brand.grid(row=0, column=0, sticky="w", padx=(24, 0), pady=14)
+        CTk.CTkLabel(
+            brand,
+            text="♪",
+            width=42,
+            height=42,
+            corner_radius=13,
+            fg_color=COLORS["accent"],
+            text_color="#FFFFFF",
+            font=ui_font(19, "bold"),
+        ).pack(side="left", padx=(0, 12))
+        brand_text = CTk.CTkFrame(brand, fg_color="transparent")
+        brand_text.pack(side="left")
+        CTk.CTkLabel(
+            brand_text,
+            text="TDL Music",
+            font=ui_font(17, "bold"),
+            text_color=COLORS["text"],
+            anchor="w",
+        ).pack(anchor="w")
+        CTk.CTkLabel(
+            brand_text,
+            text="TIDAL · YOUTUBE",
+            font=ui_font(8, "bold"),
+            text_color=COLORS["muted"],
+            anchor="w",
+        ).pack(anchor="w", pady=(1, 0))
+
+        self.source_buttons = {}
+        selector = CTk.CTkFrame(
+            navbar, fg_color=COLORS["surface_muted"], corner_radius=12
+        )
+        selector.grid(row=0, column=1, padx=24, pady=16)
+        for key in SOURCE_ORDER:
+            meta = source_meta(key)
+            button = CTk.CTkButton(
+                selector,
+                text=f"{SOURCE_ICONS[key]}  {meta['label']}",
+                width=102,
+                height=34,
+                corner_radius=9,
+                fg_color="transparent",
+                hover_color=COLORS["surface_hover"],
+                text_color=COLORS["text_secondary"],
+                font=ui_font(11, "bold"),
+                command=lambda source=key: self.switch_source(source),
+            )
+            button.pack(side="left", padx=3, pady=3)
+            self.source_buttons[key] = button
+
+        right = CTk.CTkFrame(navbar, fg_color="transparent")
+        right.grid(row=0, column=2, sticky="e", padx=(0, 24))
+        CTk.CTkLabel(
+            right,
+            text="OUTPUT",
+            font=ui_font(9, "bold"),
+            text_color=COLORS["muted"],
+        ).pack(side="left", padx=(0, 8))
+        self.format_chip = chip_label(right, "Hi-Res FLAC", height=26)
+        self.format_chip.pack(side="left")
+
+    def _build_sidebar(self):
+        sidebar = CTk.CTkFrame(
+            self, width=248, fg_color=COLORS["surface"], corner_radius=0
+        )
+        sidebar.grid(row=2, column=0, sticky="nsew")
+        sidebar.grid_propagate(False)
+
+        CTk.CTkLabel(
+            sidebar,
+            text="WORKSPACE",
+            font=ui_font(9, "bold"),
+            text_color=COLORS["muted"],
+            anchor="w",
+        ).pack(fill="x", padx=22, pady=(20, 8))
+
+        self.nav_buttons = {}
+        for name, (icon, label) in NAV_ITEMS.items():
+            button = CTk.CTkButton(
+                sidebar,
+                text=f"{icon}   {label}",
+                anchor="w",
+                height=38,
+                corner_radius=10,
+                fg_color="transparent",
+                hover_color=COLORS["surface_hover"],
+                text_color=COLORS["text_secondary"],
+                font=ui_font(12),
+                command=lambda target=name: self.switch_view(target),
+            )
+            button.pack(fill="x", padx=12, pady=2)
+            self.nav_buttons[name] = button
+
+        CTk.CTkFrame(sidebar, fg_color="transparent", height=1).pack(
+            fill="both", expand=True
+        )
+
+        folder_card = CTk.CTkFrame(
+            sidebar,
+            fg_color=COLORS["surface_muted"],
+            corner_radius=14,
+            border_width=1,
+            border_color=COLORS["border"],
+        )
+        folder_card.pack(fill="x", padx=14, pady=(0, 10))
+        folder_body = CTk.CTkFrame(folder_card, fg_color="transparent")
+        folder_body.pack(fill="x", padx=14, pady=12)
+
+        CTk.CTkLabel(
+            folder_body,
+            text="DOWNLOAD FOLDER",
+            font=ui_font(9, "bold"),
+            text_color=COLORS["muted"],
+            anchor="w",
+        ).pack(fill="x", anchor="w")
+        self.folder_name_lbl = CTk.CTkLabel(
+            folder_body,
+            text="",
+            font=ui_font(13, "bold"),
+            text_color=COLORS["text"],
+            anchor="w",
+        )
+        self.folder_name_lbl.pack(fill="x", anchor="w", pady=(4, 0))
+        self.folder_path_lbl = CTk.CTkLabel(
+            folder_body,
+            text="",
+            font=ui_font(9),
+            text_color=COLORS["text_secondary"],
+            anchor="w",
+            justify="left",
+            wraplength=192,
+        )
+        self.folder_path_lbl.pack(fill="x", anchor="w", pady=(1, 8))
+
+        folder_actions = CTk.CTkFrame(folder_body, fg_color="transparent")
+        folder_actions.pack(fill="x")
+        soft_button(
+            folder_actions,
+            "Change",
+            command=self.browse_download_folder,
+            width=84,
+            height=30,
+        ).pack(side="left")
+        ghost_button(
+            folder_actions,
+            "Open",
+            command=lambda: open_in_file_manager(self.config.download_directory),
+            width=72,
+            height=30,
+        ).pack(side="left", padx=(8, 0))
+
+        account_card = CTk.CTkFrame(
+            sidebar,
+            fg_color=COLORS["surface"],
+            corner_radius=14,
+            border_width=1,
+            border_color=COLORS["border"],
+        )
+        account_card.pack(fill="x", padx=14, pady=(0, 12))
+        account_body = CTk.CTkFrame(account_card, fg_color="transparent")
+        account_body.pack(fill="x", padx=14, pady=12)
+
+        account_head = CTk.CTkFrame(account_body, fg_color="transparent")
+        account_head.pack(fill="x")
+        self.account_dot = CTk.CTkLabel(
+            account_head,
+            text="●",
+            width=14,
+            font=ui_font(9, "bold"),
+            text_color=COLORS["muted"],
+        )
+        self.account_dot.pack(side="left")
+        CTk.CTkLabel(
+            account_head,
+            text="TIDAL ACCOUNT",
+            font=ui_font(9, "bold"),
+            text_color=COLORS["muted"],
+        ).pack(side="left", padx=(4, 0))
+
+        self.login_status_lbl = CTk.CTkLabel(
+            account_body,
+            text="Not connected",
+            font=ui_font(11, "bold"),
+            text_color=COLORS["text_secondary"],
+            anchor="w",
+            justify="left",
+            wraplength=190,
+        )
+        self.login_status_lbl.pack(fill="x", anchor="w", pady=(6, 8))
+
+        self.login_btn = primary_button(
+            account_body,
+            "Log in",
+            command=self.handle_login_click,
+            width=190,
+            height=32,
+        )
+        self.login_btn.pack(fill="x")
+
+        CTk.CTkLabel(
+            sidebar,
+            text="TDL Music · Tidal & YouTube",
+            font=ui_font(9),
+            text_color=COLORS["muted"],
+            anchor="w",
+        ).pack(fill="x", padx=22, pady=(0, 16))
+
+    # ------------------------------------------------------------------ views
+
+    def switch_view(self, view_name):
+        if not hasattr(self, "search_view"):
             return
-            
-        def safe_set(ctk_img):
+        self.active_view = view_name
+        for name, view in (
+            ("search", self.search_view),
+            ("queue", self.queue_view),
+            ("player", self.player_view),
+            ("settings", self.settings_view),
+        ):
             try:
-                if image_label.winfo_exists():
-                    image_label.configure(image=ctk_img, text="")
+                view.grid_forget()
             except Exception:
                 pass
+            self._style_nav_button(name, name == view_name)
 
-        # O2: Return cached image if available
-        if url in self._image_cache:
-            ctk_img = self._image_cache[url]
-            self.after(0, lambda: safe_set(ctk_img))
-            return
+        view = {
+            "search": self.search_view,
+            "queue": self.queue_view,
+            "player": self.player_view,
+            "settings": self.settings_view,
+        }.get(view_name, self.search_view)
+        view.grid(row=0, column=0, sticky="nsew")
+
+        if view_name == "queue":
+            self.update_queue_summary()
+        elif view_name == "player":
+            self.player_on_view_opened()
+        elif view_name == "settings":
+            self._refresh_settings_account()
+            self._sync_settings_folder()
+        elif view_name == "search":
+            self._update_search_hint()
+            self.after(80, self._focus_search_entry)
+
+    def _focus_search_entry(self):
         try:
-            # O1: Reuse the shared API session instead of creating a new one
-            session = await self.api.get_session()
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    image = Image.open(io.BytesIO(data))
-                    ctk_img = CTk.CTkImage(light_image=image, dark_image=image, size=(70, 70))
-                    # B2: Store reference to prevent garbage collection
-                    self._image_refs.append(ctk_img)
-                    # O2: Cache for re-searches
-                    self._image_cache[url] = ctk_img
-                    self.after(0, lambda: safe_set(ctk_img))
-        except Exception as e:
-            print(f"Failed to load image {url}: {e}")
-
-    async def load_and_set_specs(self, track_id, badge_label):
-        """Asynchronously queries exact stream resolution (bit depth & sample rate) and updates badge dynamically."""
-        if not track_id or not badge_label:
-            return
-            
-        def safe_set_badge(text, color):
-            try:
-                if badge_label.winfo_exists():
-                    badge_label.configure(text=text, fg_color=color)
-            except Exception:
-                pass
-
-        if track_id in self._specs_cache:
-            text, color = self._specs_cache[track_id]
-            self.after(0, lambda: safe_set_badge(text, color))
-            return
-            
-        try:
-            specs = await self.api.get_track_specs(track_id)
-            if specs and specs.get("bit_depth"):
-                text, color = format_specs(
-                    specs["bit_depth"], 
-                    specs["sample_rate"], 
-                    specs.get("audio_quality", ""),
-                    specs.get("audio_mode", "STEREO")
-                )
-                self._specs_cache[track_id] = (text, color)
-                self.after(0, lambda: safe_set_badge(text, color))
-        except Exception as e:
+            self.search_entry.focus_set()
+        except Exception:
             pass
 
+    def _style_nav_button(self, name, active):
+        button = getattr(self, "nav_buttons", {}).get(name)
+        if button is None:
+            return
+        icon, label = NAV_ITEMS[name]
+        if active:
+            button.configure(
+                fg_color=COLORS["accent_soft"],
+                text_color=COLORS["accent_text"],
+                font=ui_font(12, "bold"),
+            )
+        else:
+            button.configure(
+                fg_color="transparent",
+                text_color=COLORS["text_secondary"],
+                font=ui_font(12),
+            )
+            if name == "queue":
+                button.configure(text=f"{icon}   {label}")
+
+    def switch_source(self, source, initial=False):
+        if source not in SOURCE_META:
+            return
+        changed = source != self.source
+        self.source = source
+
+        for key, button in getattr(self, "source_buttons", {}).items():
+            meta = source_meta(key)
+            if key == source:
+                button.configure(
+                    fg_color=COLORS["surface"],
+                    hover_color=COLORS["surface"],
+                    text_color=meta["color"],
+                    border_width=1,
+                    border_color=COLORS["border"],
+                    font=ui_font(11, "bold"),
+                )
+            else:
+                button.configure(
+                    fg_color="transparent",
+                    hover_color=COLORS["surface_hover"],
+                    text_color=COLORS["text_secondary"],
+                    border_width=0,
+                    font=ui_font(11),
+                )
+
+        if hasattr(self, "format_chip"):
+            meta = source_meta(source)
+            self.format_chip.configure(
+                text=meta["format"], fg_color=meta["soft"], text_color=meta["color"]
+            )
+        if hasattr(self, "search_btn"):
+            self._update_search_copy()
+
+        if initial:
+            self._show_source_intro()
+            return
+        self.switch_view("search")
+        if changed:
+            self._show_source_intro()
+
+    def _display_folder(self):
+        path = getattr(self.config, "download_directory", "") or ""
+        if hasattr(self, "folder_name_lbl"):
+            name = os.path.basename(os.path.normpath(path)) or path or "Not set"
+            self.folder_name_lbl.configure(text=truncate_middle(name, 26))
+        if hasattr(self, "folder_path_lbl"):
+            self.folder_path_lbl.configure(text=truncate_middle(path, 34))
+        if hasattr(self, "open_folder_btn") and self.open_folder_btn.winfo_exists():
+            self.open_folder_btn.configure(
+                command=lambda: open_in_file_manager(self.config.download_directory)
+            )
+        entry = getattr(self, "settings_folder_entry", None)
+        if entry is not None and entry.winfo_exists():
+            entry.delete(0, "end")
+            entry.insert(0, path)
+
+    def _sync_settings_folder(self):
+        entry = getattr(self, "settings_folder_entry", None)
+        if entry is not None and entry.winfo_exists():
+            entry.delete(0, "end")
+            entry.insert(0, self.config.download_directory)
+
+    # ------------------------------------------------------------------ login
+
     def check_login_status(self):
-        """Verifies session token on load."""
         if self.config.access_token:
-            # Check if token needs refresh
             if self.config.token_expiry - time.time() < 3600:
                 self.run_async(self.refresh_token_on_load())
             else:
@@ -779,8 +532,8 @@ class AppUI(CTk.CTk):
         try:
             await self.api.fetch_session_info()
             self.after(0, self.update_login_display, True)
-        except Exception as e:
-            print(f"Session verification failed on startup: {e}")
+        except Exception as exc:
+            print(f"Session verification failed on startup: {exc}")
             self.config.clear_session()
             self.after(0, self.update_login_display, False)
 
@@ -788,1248 +541,539 @@ class AppUI(CTk.CTk):
         try:
             await self.api.refresh_token()
             self.after(0, self.update_login_display, True)
-        except Exception as e:
-            print(f"Token refresh failed on startup: {e}")
+        except Exception as exc:
+            print(f"Token refresh failed on startup: {exc}")
             self.config.clear_session()
             self.after(0, self.update_login_display, False)
 
     def update_login_display(self, logged_in):
-        """Updates login indicator in sidebar."""
-        if logged_in:
-            user = self.config.user_name or f"User {self.config.user_id}"
-            self.login_status_lbl.configure(text=f"Logged In:\n{user}", text_color=COLOR_ACCENT)
-            self.login_btn.configure(text="Logout", fg_color=COLOR_FRAME_BG, hover_color="#333333", text_color="white", border_color="#e53935", border_width=1)
-        else:
-            self.login_status_lbl.configure(text="Logged Out", text_color=COLOR_TEXT_MUTED)
-            self.login_btn.configure(text="Login", fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="black", border_width=0)
-
-    def setup_layout(self):
-        # Grid layout (1 row, 2 columns)
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=1)
-        
-        # 1. Sidebar Navigation Panel
-        sidebar = CTk.CTkFrame(self, width=200, corner_radius=0, fg_color=COLOR_FRAME_BG)
-        sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.grid_rowconfigure(4, weight=1)
-        
-        logo = CTk.CTkLabel(sidebar, text="TIDAL RIP", font=CTk.CTkFont(size=22, weight="bold"), text_color=COLOR_ACCENT)
-        logo.grid(row=0, column=0, padx=20, pady=(30, 20))
-        
-        # Nav buttons
-        self.btn_search = CTk.CTkButton(sidebar, text="Search Catalog", fg_color=COLOR_DARK_BG, text_color="white", hover_color="#2a2a2a", height=40, anchor="w", command=lambda: self.switch_view("search"))
-        self.btn_search.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
-        
-        self.btn_queue = CTk.CTkButton(sidebar, text="Downloads Queue", fg_color="transparent", text_color=COLOR_TEXT_MUTED, hover_color="#2a2a2a", height=40, anchor="w", command=lambda: self.switch_view("queue"))
-        self.btn_queue.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
-        
-        self.btn_settings = CTk.CTkButton(sidebar, text="Settings", fg_color="transparent", text_color=COLOR_TEXT_MUTED, hover_color="#2a2a2a", height=40, anchor="w", command=lambda: self.switch_view("settings"))
-        self.btn_settings.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
-        
-        # Account Status Panel (Bottom Sidebar)
-        acc_panel = CTk.CTkFrame(sidebar, fg_color="transparent")
-        acc_panel.grid(row=5, column=0, padx=10, pady=20, sticky="ew")
-        
-        self.login_status_lbl = CTk.CTkLabel(acc_panel, text="Checking...", font=CTk.CTkFont(size=12), text_color=COLOR_TEXT_MUTED)
-        self.login_status_lbl.pack(pady=5)
-        
-        self.login_btn = CTk.CTkButton(acc_panel, text="Login", fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="black", command=self.handle_login_click)
-        self.login_btn.pack(fill="x", padx=10, pady=5)
-        
-        # 2. Main Content Frame (Contains multiple views)
-        self.main_container = CTk.CTkFrame(self, fg_color="transparent")
-        self.main_container.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
-        self.main_container.grid_rowconfigure(0, weight=1)
-        self.main_container.grid_columnconfigure(0, weight=1)
-        
-        # Initialize views
-        self.create_search_view()
-        self.create_queue_view()
-        self.create_settings_view()
-        
-        # Set default view
-        self.switch_view("search")
-
-    def switch_view(self, view_name):
-        """Switches active subview in the container."""
-        # Hide all
-        self.search_view.grid_forget()
-        self.queue_view.grid_forget()
-        self.settings_view.grid_forget()
-        
-        # Reset button styles
-        self.btn_search.configure(fg_color="transparent", text_color=COLOR_TEXT_MUTED)
-        self.btn_queue.configure(fg_color="transparent", text_color=COLOR_TEXT_MUTED)
-        self.btn_settings.configure(fg_color="transparent", text_color=COLOR_TEXT_MUTED)
-        
-        if view_name == "search":
-            self.search_view.grid(row=0, column=0, sticky="nsew")
-            self.btn_search.configure(fg_color=COLOR_FRAME_BG, text_color="white")
-        elif view_name == "queue":
-            self.queue_view.grid(row=0, column=0, sticky="nsew")
-            self.btn_queue.configure(fg_color=COLOR_FRAME_BG, text_color="white")
-        elif view_name == "settings":
-            self.settings_view.grid(row=0, column=0, sticky="nsew")
-            self.btn_settings.configure(fg_color=COLOR_FRAME_BG, text_color="white")
-
-    # --- Login Flows (PKCE Authorization Code) ---
+        logged_in = bool(logged_in and self.config.access_token)
+        if hasattr(self, "login_status_lbl"):
+            if logged_in:
+                user = self.config.user_name or f"User {self.config.user_id}"
+                self.login_status_lbl.configure(
+                    text=user, text_color=COLORS["text"]
+                )
+            else:
+                self.login_status_lbl.configure(
+                    text="Not connected", text_color=COLORS["text_secondary"]
+                )
+        if hasattr(self, "account_dot"):
+            self.account_dot.configure(
+                text_color=COLORS["success"] if logged_in else COLORS["muted"]
+            )
+        if hasattr(self, "login_btn"):
+            self.login_btn.configure(state="normal")
+            if logged_in:
+                self.login_btn.configure(
+                    text="Log out",
+                    fg_color=COLORS["accent_soft"],
+                    hover_color=COLORS["surface_hover"],
+                    text_color=COLORS["accent_text"],
+                    border_width=0,
+                )
+            else:
+                self.login_btn.configure(
+                    text="Log in",
+                    fg_color=COLORS["accent"],
+                    hover_color=COLORS["accent_hover"],
+                    text_color="#FFFFFF",
+                    border_width=0,
+                )
+        if hasattr(self, "settings_account_btn"):
+            self._refresh_settings_account()
+        if hasattr(self, "search_hint_lbl"):
+            self._update_search_hint()
 
     def handle_login_click(self):
         if self.config.access_token:
-            self.config.clear_session()
-            self.update_login_display(False)
-            messagebox.showinfo("Logged Out", "You have been logged out.")
-        else:
-            if hasattr(self, "login_in_progress") and self.login_in_progress:
-                return
-            self.start_pkce_login()
+            if messagebox.askyesno("Log out", "Disconnect your Tidal account?"):
+                self.config.clear_session()
+                self.update_login_display(False)
+                messagebox.showinfo("Logged out", "Your Tidal session has been cleared.")
+            return
+        if self.login_in_progress:
+            return
+        self.start_pkce_login()
 
     def start_pkce_login(self):
-        """Generates PKCE URL, opens browser, and shows redirect URL input dialog."""
         self.login_in_progress = True
-        self.login_btn.configure(state="disabled", text="Logging in...")
-        login_url = self.api.get_pkce_login_url()
+        if hasattr(self, "login_btn") and self.login_btn.winfo_exists():
+            self.login_btn.configure(state="disabled", text="Connecting…")
+        try:
+            login_url = self.api.get_pkce_login_url()
+        except Exception as exc:
+            self.login_in_progress = False
+            self.update_login_display(False)
+            messagebox.showerror("Login failed", f"Could not start Tidal login:\n{exc}")
+            return
         open_browser(login_url, self.config.login_browser)
         self.show_pkce_redirect_dialog()
 
     def show_pkce_redirect_dialog(self):
-        """Shows a dialog where the user pastes the redirect URL after login."""
         dialog = CTk.CTkToplevel(self)
-        dialog.title("Complete Login")
-        dialog.geometry("580x290")
+        dialog.title("Tidal login")
+        dialog.geometry("620x350")
         dialog.resizable(False, False)
-        dialog.configure(fg_color=COLOR_DARK_BG)
+        dialog.configure(fg_color=COLORS["bg"])
+        dialog.transient(self)
         dialog.grab_set()
-        dialog.focus_force()
+        dialog.update_idletasks()
+        try:
+            x = self.winfo_x() + (self.winfo_width() - 620) // 2
+            y = self.winfo_y() + (self.winfo_height() - 350) // 2
+            dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
 
-        CTk.CTkLabel(
-            dialog,
-            text="Log in with Tidal in your browser",
-            font=CTk.CTkFont(size=16, weight="bold"),
-        ).pack(pady=(22, 4))
+        def close_dialog():
+            self.login_in_progress = False
+            if hasattr(self, "login_btn") and self.login_btn.winfo_exists():
+                self.login_btn.configure(state="normal")
+            self.update_login_display(bool(self.config.access_token))
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
 
-        CTk.CTkLabel(
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        dialog.bind("<Escape>", lambda _event: close_dialog())
+        dialog.after(80, dialog.focus_force)
+
+        body = CTk.CTkFrame(
             dialog,
-            text="After logging in, your browser will redirect to an error page.\nCopy the FULL URL from the browser address bar and paste it below.",
-            font=CTk.CTkFont(size=12),
-            text_color=COLOR_TEXT_MUTED,
-            justify="center",
-        ).pack(pady=(0, 14))
+            fg_color=COLORS["surface"],
+            corner_radius=18,
+            border_width=1,
+            border_color=COLORS["border"],
+        )
+        body.pack(fill="both", expand=True, padx=18, pady=18)
+        inner = CTk.CTkFrame(body, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=22, pady=20)
+
+        chip_label(
+            inner,
+            "TIDAL LOGIN",
+            fg_color=source_meta("tidal")["soft"],
+            text_color=source_meta("tidal")["color"],
+        ).pack(anchor="w")
+        CTk.CTkLabel(
+            inner,
+            text="Complete sign-in in your browser",
+            font=ui_font(17, "bold"),
+            text_color=COLORS["text"],
+            anchor="w",
+        ).pack(fill="x", anchor="w", pady=(8, 4))
+        CTk.CTkLabel(
+            inner,
+            text=(
+                "After signing in, your browser lands on an error page. Copy the full URL "
+                "from the address bar and paste it below."
+            ),
+            font=ui_font(10),
+            text_color=COLORS["text_secondary"],
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        ).pack(fill="x", anchor="w")
 
         url_entry = CTk.CTkEntry(
-            dialog,
-            placeholder_text="https://tidal.com/android/login/auth?code=...",
-            height=42,
-            font=CTk.CTkFont(size=12),
-            width=530,
+            inner,
+            placeholder_text="https://tidal.com/android/login/auth?code=…",
+            height=40,
+            corner_radius=9,
+            border_width=1,
+            border_color=COLORS["border"],
+            fg_color=COLORS["surface_muted"],
+            text_color=COLORS["text"],
+            font=ui_font(11),
         )
-        url_entry.pack(padx=20, pady=(0, 10))
+        url_entry.pack(fill="x", pady=(14, 6))
+        url_entry.bind("<Return>", lambda _event: submit())
+        url_entry.focus_set()
 
-        status_lbl = CTk.CTkLabel(dialog, text="", font=CTk.CTkFont(size=11), text_color=COLOR_ACCENT)
-        status_lbl.pack()
+        status_lbl = CTk.CTkLabel(
+            inner, text="", font=ui_font(10), text_color=COLORS["error"], anchor="w"
+        )
+        status_lbl.pack(fill="x", anchor="w")
 
-        def on_submit():
-            import urllib.parse as _up
+        footer = CTk.CTkFrame(inner, fg_color="transparent")
+        footer.pack(fill="x", pady=(12, 0))
+
+        submit_btn = primary_button(
+            footer, "Complete login", command=lambda: submit(), width=156, height=38
+        )
+        submit_btn.pack(side="right")
+        ghost_button(
+            footer, "Cancel", command=close_dialog, width=92, height=38
+        ).pack(side="right", padx=(0, 8))
+
+        def submit():
             pasted = url_entry.get().strip()
-            if "code=" not in pasted:
-                status_lbl.configure(text="Invalid URL — must contain 'code='", text_color="#e53935")
+            if not pasted:
+                status_lbl.configure(text="Paste the redirect URL to continue.")
                 return
-            parsed = _up.urlparse(pasted)
-            qs = _up.parse_qs(parsed.query)
-            auth_code = qs.get("code", [None])[0]
+            auth_code = None
+            if "code=" in pasted:
+                parsed = urllib.parse.urlparse(pasted)
+                auth_code = (urllib.parse.parse_qs(parsed.query).get("code") or [None])[0]
+                if not auth_code and parsed.fragment:
+                    fragment = urllib.parse.parse_qs(parsed.fragment)
+                    auth_code = (fragment.get("code") or [None])[0]
+            elif " " not in pasted and "://" not in pasted:
+                auth_code = pasted
             if not auth_code:
-                status_lbl.configure(text="Could not extract code from URL.", text_color="#e53935")
+                status_lbl.configure(
+                    text="Could not find a login code in that URL."
+                )
                 return
-            status_lbl.configure(text="Exchanging token...", text_color=COLOR_ACCENT)
-            dialog.update()
+            status_lbl.configure(text="Exchanging token…", text_color=COLORS["accent_text"])
+            submit_btn.configure(state="disabled", text="Signing in…")
             self.run_async(self.exchange_pkce_code(auth_code, dialog))
-
-        CTk.CTkButton(
-            dialog,
-            text="Complete Login",
-            fg_color=COLOR_ACCENT,
-            hover_color=COLOR_ACCENT_HOVER,
-            text_color="black",
-            height=38,
-            width=180,
-            font=CTk.CTkFont(size=13, weight="bold"),
-            command=on_submit,
-        ).pack(pady=(10, 0))
 
     async def exchange_pkce_code(self, auth_code, dialog):
         try:
             await self.api.exchange_pkce_code(auth_code)
             self.after(0, self.login_success, dialog)
-        except Exception as e:
-            err_msg = str(e)
-            self.after(0, lambda: self.login_fail(err_msg, dialog))
+        except Exception as exc:
+            message = str(exc)
+            self.after(0, lambda: self.login_fail(message, dialog))
 
     def login_success(self, dialog=None):
         self.login_in_progress = False
-        self.login_btn.configure(state="normal")
-        if dialog and dialog.winfo_exists():
+        if dialog is not None and dialog.winfo_exists():
             dialog.destroy()
         self.update_login_display(True)
         messagebox.showinfo(
-            "Login Success",
-            f"Logged in successfully!\nUser ID: {self.config.user_id}\nCountry: {self.api.country_code}"
+            "Login successful",
+            f"Connected to Tidal.\nUser ID: {self.config.user_id}\nCountry: {self.api.country_code}",
         )
 
     def login_fail(self, error, dialog=None):
         self.login_in_progress = False
-        self.login_btn.configure(state="normal", text="Login")
-        if dialog and dialog.winfo_exists():
+        if dialog is not None and dialog.winfo_exists():
             dialog.destroy()
         self.update_login_display(False)
-        messagebox.showerror("Login Failed", f"Authorization failed:\n{error}")
+        messagebox.showerror("Login failed", f"Tidal authorization failed:\n{error}")
 
-    # --- Search View ---
+    # ----------------------------------------------------------------- images
 
-    def create_search_view(self):
-        self.search_view = CTk.CTkFrame(self.main_container, fg_color="transparent")
-        self.search_view.grid_rowconfigure(1, weight=1)
-        self.search_view.grid_columnconfigure(0, weight=1)
-        
-        # Search controls
-        search_ctrl = CTk.CTkFrame(self.search_view, fg_color="transparent")
-        search_ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 15))
-        search_ctrl.grid_columnconfigure(0, weight=1)
-        
-        entry_box = CTk.CTkFrame(search_ctrl, fg_color="transparent")
-        entry_box.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        entry_box.grid_columnconfigure(0, weight=1)
-
-        self.search_entry = CTk.CTkEntry(
-            entry_box, 
-            placeholder_text="Search terms, Tidal / Spotify / Apple Music / YouTube / Amazon / Qobuz URL...", 
-            height=40, 
-            font=CTk.CTkFont(size=14)
-        )
-        self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.search_entry.bind("<Return>", lambda e: self.trigger_search())
-        
-        self.clear_search_btn = CTk.CTkButton(
-            entry_box,
-            text="✕",
-            width=36,
-            height=40,
-            fg_color="#2b2b2b",
-            hover_color="#444444",
-            text_color="#aaaaaa",
-            font=CTk.CTkFont(size=13, weight="bold"),
-            command=self.clear_search_entry
-        )
-        self.clear_search_btn.grid(row=0, column=1, sticky="e")
-        
-        self.search_type_menu = CTk.CTkOptionMenu(
-            search_ctrl,
-            values=["Tracks", "Albums", "Playlists", "Artists"],
-            width=110,
-            height=40,
-            fg_color=COLOR_FRAME_BG,
-            button_color=COLOR_FRAME_BG,
-            button_hover_color="#333333",
-            dropdown_fg_color=COLOR_FRAME_BG
-        )
-        self.search_type_menu.grid(row=0, column=1, sticky="w", padx=(0, 10))
-        
-        self.search_btn = CTk.CTkButton(
-            search_ctrl, 
-            text="Search", 
-            fg_color=COLOR_ACCENT, 
-            hover_color=COLOR_ACCENT_HOVER, 
-            text_color="black", 
-            width=100, 
-            height=40, 
-            font=CTk.CTkFont(size=13, weight="bold"), 
-            command=self.trigger_search
-        )
-        self.search_btn.grid(row=0, column=2, sticky="e")
-        
-        # Results frame
-        self.results_scroll = CTk.CTkScrollableFrame(self.search_view, fg_color=COLOR_FRAME_BG)
-        self.results_scroll.grid(row=1, column=0, sticky="nsew")
-
-    def clear_search_entry(self):
-        """Clears the search input bar."""
-        self.search_entry.delete(0, "end")
-        self.search_entry.focus_set()
-
-    def show_search_status(self, text):
-        for child in self.results_scroll.winfo_children():
-            child.destroy()
-        lbl = CTk.CTkLabel(self.results_scroll, text=text, font=CTk.CTkFont(size=14, slant="italic"), justify="center")
-        lbl.pack(pady=40)
-
-    def trigger_search(self):
-        query = self.search_entry.get().strip()
-        if not query:
+    def load_image(self, url, label, size=64):
+        if not url or label is None:
             return
-            
-        if not self.config.access_token:
-            messagebox.showwarning("Login Required", "You must be logged in to search Tidal catalog.")
+        key = (url, size)
+        cached = self._image_cache.get(key)
+        if cached is not None:
+            self._apply_image(label, cached)
             return
+        self.run_async(self._fetch_image(url, label, size, key))
 
-        self._search_gen = getattr(self, "_search_gen", 0) + 1
-        my_gen = self._search_gen
-
-        if hasattr(self, "search_btn") and self.search_btn.winfo_exists():
-            self.search_btn.configure(state="disabled", text="Searching...")
-            
-        self.show_search_status("Searching Tidal catalog...")
-        
-        search_type = self.search_type_menu.get().lower()
-        self.run_async(self.perform_search(query, search_type, gen=my_gen))
-
-    def finish_search(self, data, search_type, error_msg=None, gen=None):
-        """Thread-safe UI callback for search completion with race-condition guard."""
-        if hasattr(self, "search_btn") and self.search_btn.winfo_exists():
-            self.search_btn.configure(state="normal", text="Search")
-        if gen is not None and getattr(self, "_search_gen", 0) != gen:
-            return  # Older search superseded by a newer query
-        if error_msg:
-            messagebox.showerror("Search Error", error_msg)
-        elif data is not None:
-            self.populate_results(data, search_type)
-
-    def trigger_artist_albums_search(self, artist_id, artist_name=""):
-        """Directly retrieves and displays all catalog albums for an artist."""
-        self.search_entry.delete(0, "end")
-        self.search_entry.insert(0, f"https://tidal.com/artist/{artist_id}")
-        self.search_type_menu.set("Albums")
-
-        self._search_gen = getattr(self, "_search_gen", 0) + 1
-        my_gen = self._search_gen
-
-        if hasattr(self, "search_btn") and self.search_btn.winfo_exists():
-            self.search_btn.configure(state="disabled", text="Searching...")
-        
-        lbl_text = f"Fetching albums for {artist_name}..." if artist_name else "Fetching artist albums..."
-        self.show_search_status(lbl_text)
-        
-        async def fetch_albums():
-            try:
-                albums_resp = await self.api.get_artist_albums(artist_id)
-                self.after(0, self.finish_search, albums_resp, "albums", None, my_gen)
-            except Exception as e:
-                err_msg = str(e)
-                self.after(0, self.finish_search, None, "albums", f"Failed to retrieve albums: {err_msg}", my_gen)
-                
-        self.run_async(fetch_albums())
-
-    async def perform_search(self, query, search_type, gen=None):
-        query = query.strip()
-        
-        # 1. External music links (Spotify, Apple Music, YouTube Music, Deezer, SoundCloud, Amazon, Qobuz, Bandcamp)
-        if is_external_music_link(query):
-            self.after(0, lambda: self.show_search_status("Resolving external streaming link..."))
-            resolved_query, resolved_type, display_info, service_name = await resolve_external_link(query)
-            if resolved_query:
-                if resolved_type:
-                    self.after(0, lambda t=resolved_type.capitalize(): self.search_type_menu.set(t))
-                    search_type = resolved_type
-                
-                self.after(0, lambda info=display_info, svc=service_name: self.show_search_status(f"Found on {svc}: {info}\nSearching Tidal catalog..."))
-                
-                try:
-                    results = await self.api.smart_search(resolved_query, search_type=search_type, limit=50)
-                    self.after(0, self.finish_search, results, search_type, None, gen)
-                except Exception as e:
-                    err_msg = str(e)
-                    self.after(0, self.finish_search, None, search_type, f"Search request failed: {err_msg}", gen)
-                return
-            else:
-                self.after(0, lambda: self.finish_search(None, search_type, None, gen))
-                self.after(0, lambda: messagebox.showwarning("Link Unresolved", "Could not extract song/album metadata from this link. Please check the URL."))
-                return
-
-        # 2. Tidal direct URL link routing
-        url_type, url_id = parse_tidal_url(query)
-        if url_type:
-            try:
-                if url_type == "track":
-                    track = await self.api.get_track(url_id)
-                    results = {"tracks": {"items": [track]}}
-                    self.after(0, self.finish_search, results, "tracks", None, gen)
-                elif url_type == "album":
-                    album = await self.api.get_album(url_id)
-                    results = {"albums": {"items": [album]}}
-                    self.after(0, self.finish_search, results, "albums", None, gen)
-                elif url_type == "playlist":
-                    playlist = await self.api.get_playlist(url_id)
-                    results = {"playlists": {"items": [playlist]}}
-                    self.after(0, self.finish_search, results, "playlists", None, gen)
-                elif url_type == "artist":
-                    albums_resp = await self.api.get_artist_albums(url_id)
-                    self.after(0, self.finish_search, albums_resp, "albums", None, gen)
-            except Exception as e:
-                err_msg = str(e)
-                self.after(0, self.finish_search, None, search_type, f"Failed to retrieve link metadata: {err_msg}", gen)
-            return
-
-        # 3. High-quality smart string search
+    def _apply_image(self, label, image):
         try:
-            results = await self.api.smart_search(query, search_type=search_type, limit=50)
-            self.after(0, self.finish_search, results, search_type, None, gen)
-        except Exception as e:
-            err_msg = str(e)
-            self.after(0, self.finish_search, None, search_type, f"Search request failed: {err_msg}", gen)
+            if label.winfo_exists():
+                label.configure(image=image, text="")
+        except Exception:
+            pass
 
-    def populate_results(self, data, search_type):
-        # Clear loading label
-        for child in self.results_scroll.winfo_children():
-            child.destroy()
-            
-        items = []
-        if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
-            items = data["items"]
-        elif search_type == "tracks" and "tracks" in data:
-            items = data["tracks"].get("items", [])
-        elif search_type == "albums" and "albums" in data:
-            items = data["albums"].get("items", [])
-        elif search_type == "playlists" and "playlists" in data:
-            items = data["playlists"].get("items", [])
-        elif search_type == "artists" and "artists" in data:
-            items = data["artists"].get("items", [])
-            
-        if not items:
-            lbl = CTk.CTkLabel(self.results_scroll, text="No results found.", font=CTk.CTkFont(size=14))
-            lbl.pack(pady=40)
-            return
-            
-        for idx, item in enumerate(items):
-            row = CTk.CTkFrame(self.results_scroll, fg_color="transparent", height=90)
-            row.pack(fill="x", pady=5, padx=5)
-            row.pack_propagate(False)
-            
-            image_url = None
-            quality_badge_text = ""
-            quality_badge_color = "#333333"
-
-            btn_text = "Download"
-            if search_type == "tracks":
-                title = item.get("title", "Unknown Title")
-                artists = item.get("artists", [])
-                artist = artists[0]["name"] if artists else "Unknown Artist"
-                album_info = item.get("album", {})
-                album = album_info.get("title", "Unknown Album")
-                display_text = f"{title}\nBy {artist} — {album}"
-                item_id = item["id"]
-                action_func = lambda i=item_id, t=title: self.queue_track_download(i, t)
-                
-                cover_id = album_info.get("cover")
-                if cover_id:
-                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
-                
-                quality_badge_text, quality_badge_color = get_quality_badge(item)
-                    
-            elif search_type == "albums":
-                title = item.get("title", "Unknown Title")
-                artists = item.get("artists", [])
-                artist = artists[0]["name"] if artists else "Unknown Artist"
-                display_text = f"Album: {title}\nBy {artist}"
-                item_id = item["id"]
-                action_func = lambda i=item_id, t=title: self.queue_album_downloads(i, t)
-                
-                cover_id = item.get("cover")
-                if cover_id:
-                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
-                    
-                quality_badge_text, quality_badge_color = get_quality_badge(item)
-                    
-            elif search_type == "playlists":
-                title = item.get("title", "Unknown Title")
-                display_text = f"Playlist: {title}\nTracks: {item.get('numberOfTracks', 'Unknown')}"
-                item_id = item["uuid"]
-                action_func = lambda i=item_id, t=title: self.queue_playlist_downloads(i, t)
-                
-                cover_id = item.get("squareImage")
-                if cover_id:
-                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
-                    
-            elif search_type == "artists":
-                name = item.get("name", "Unknown Artist")
-                display_text = f"Artist: {name}"
-                item_id = item["id"]
-                action_func = lambda i=item_id, n=name: self.trigger_artist_albums_search(i, n)
-                btn_text = "View Albums"
-                
-                cover_id = item.get("picture")
-                if cover_id:
-                    image_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/160x160.jpg"
-                    
-            img_lbl = CTk.CTkLabel(row, text="Loading...", width=70, height=70, fg_color="#222222")
-            img_lbl.pack(side="left", padx=(0, 10))
-            
-            if image_url:
-                self.run_async(self.load_and_set_image(image_url, img_lbl))
+    async def _fetch_image(self, url, label, size, key):
+        session = None
+        owns_session = False
+        try:
+            if self.api:
+                session = await self.api.get_session()
             else:
-                img_lbl.configure(text="No Image")
-                
-            if search_type == 'tracks':
-                def toggle_preview(tid=item_id, pbtn=None):
-                    # Stop current playback
-                    winsound.PlaySound(None, winsound.SND_PURGE)
-                    if self.preview_proc is not None:
-                        try:
-                            if self.preview_proc.poll() is None:
-                                self.preview_proc.terminate()
-                                self.preview_proc.wait(timeout=2)
-                        except Exception:
-                            pass
-                    
-                    # Reset previous button
-                    if self.active_pbtn and self.active_pbtn is not pbtn:
-                        try:
-                            self.active_pbtn.configure(text='▶')
-                        except Exception:
-                            pass
-                        
-                    # Toggle: if same track, stop
-                    if self.preview_tid == tid:
-                        self.preview_tid = None
-                        self.active_pbtn = None
-                        pbtn.configure(text='▶')
-                        # Increment generation to signal any running thread to abort
-                        self._preview_gen = getattr(self, '_preview_gen', 0) + 1
-                        return
-                        
-                    pbtn.configure(text='⏳')
-                    self.preview_tid = tid
-                    self.active_pbtn = pbtn
-                    # Increment generation so old threads know to abort
-                    self._preview_gen = getattr(self, '_preview_gen', 0) + 1
-                    my_gen = self._preview_gen
-                    
-                    def play_stream():
-                        try:
-                            # Use track-specific temp files in dedicated preview cache
-                            preview_dir = os.path.join(self.config.config_dir, "previews")
-                            os.makedirs(preview_dir, exist_ok=True)
-                            tmp_m4a = os.path.join(preview_dir, f"preview_{tid}.m4a")
-                            tmp_wav = os.path.join(preview_dir, f"preview_{tid}.wav")
-                            
-                            # Check if we already have cached WAV for this track
-                            if not (os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000):
-                                # Download audio segments
-                                async def fetch_audio():
-                                    info = await self.api.get_stream_info(tid, 'LOW')
-                                    session = await self.api.get_session()
-                                    with open(tmp_m4a, "wb") as f:
-                                        if info['type'] == 'direct':
-                                            async with session.get(info['url']) as resp:
-                                                f.write(await resp.content.read(1024 * 500))
-                                        else:
-                                            async with session.get(info['init_url']) as resp:
-                                                f.write(await resp.read())
-                                            for seg in info.get('segment_urls', [])[:3]:
-                                                async with session.get(seg) as resp:
-                                                    f.write(await resp.read())
-                                    return tmp_m4a
-                                    
-                                future = asyncio.run_coroutine_threadsafe(fetch_audio(), self.async_loop)
-                                future.result(timeout=30)
-                                
-                                # Abort if user switched to another track
-                                if self._preview_gen != my_gen:
-                                    return
-                                
-                                # Convert to WAV
-                                ff_exe = imageio_ffmpeg.get_ffmpeg_exe()
-                                self.preview_proc = subprocess.Popen(
-                                    [ff_exe, "-y", "-i", tmp_m4a, "-f", "wav", tmp_wav],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                                )
-                                self.preview_proc.wait()
-                                
-                                # Clean up m4a temp
-                                try:
-                                    os.remove(tmp_m4a)
-                                except Exception:
-                                    pass
-                            
-                            # Final abort check before playing
-                            if self._preview_gen != my_gen:
-                                return
-                            
-                            def safe_pbtn(txt):
-                                try:
-                                    if pbtn.winfo_exists():
-                                        pbtn.configure(text=txt)
-                                except Exception:
-                                    pass
-
-                            if os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000:
-                                self.after(0, lambda: safe_pbtn('⏹'))
-                                winsound.PlaySound(tmp_wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                            else:
-                                self.after(0, lambda: safe_pbtn('▶'))
-                        except Exception as e:
-                            print('Preview error', e)
-                            self.after(0, lambda: safe_pbtn('▶'))
-                            
-                    threading.Thread(target=play_stream, daemon=True).start()
-
-            # Pack action buttons to the right FIRST so they are anchored and never displaced
-            btn_box = CTk.CTkFrame(row, fg_color="transparent")
-            btn_box.pack(side="right", padx=(5, 10), pady=20)
-
-            dl_btn = CTk.CTkButton(
-                btn_box, 
-                text=btn_text, 
-                fg_color=COLOR_ACCENT, 
-                hover_color=COLOR_ACCENT_HOVER, 
-                text_color="black",
-                width=100, 
-                font=CTk.CTkFont(size=11, weight="bold"),
-                command=action_func
+                session = aiohttp.ClientSession()
+                owns_session = True
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=20)
+            ) as response:
+                if response.status != 200:
+                    return
+                data = await response.read()
+            image = Image.open(io.BytesIO(data))
+            rounded = rounded_image(image, size=size, radius=max(8, size // 5))
+            ctk_image = CTk.CTkImage(
+                light_image=rounded, dark_image=rounded, size=(size, size)
             )
-            dl_btn.pack(side="right", padx=(5, 0))
+            self._image_cache[key] = ctk_image
+            self._image_refs.append(ctk_image)
+            self.after(0, self._apply_image, label, ctk_image)
+        except Exception as exc:
+            print(f"Failed to load image {url}: {exc}")
+        finally:
+            if owns_session and session is not None:
+                await session.close()
 
-            if search_type == 'tracks':
-                pbtn = CTk.CTkButton(btn_box, text='▶', width=30, fg_color='#444', hover_color='#666')
-                pbtn.configure(command=lambda p=pbtn, t=item_id: toggle_preview(tid=t, pbtn=p))
-                pbtn.pack(side="right", padx=(0, 5))
-
-            # Pack text frame LAST with expand=True so it claims all remaining middle space
-            text_frame = CTk.CTkFrame(row, fg_color="transparent")
-            text_frame.pack(side="left", fill="both", expand=True)
-            
-            info_lbl = CTk.CTkLabel(text_frame, text=display_text, font=CTk.CTkFont(size=12), anchor="w", justify="left")
-            info_lbl.pack(anchor="w", pady=(5, 5))
-            
-            if quality_badge_text:
-                badge = CTk.CTkLabel(text_frame, text=quality_badge_text, font=CTk.CTkFont(size=10, weight="bold"), text_color="black", fg_color=quality_badge_color, corner_radius=4, padx=5, height=20)
-                badge.pack(anchor="w")
-                if search_type == 'tracks':
-                    self.run_async(self.load_and_set_specs(item_id, badge))
-            
-            divider = CTk.CTkFrame(self.results_scroll, fg_color="#333333", height=1)
-            divider.pack(fill="x", padx=5)
-
-    # --- Queue View ---
-
-    def create_queue_view(self):
-        self.queue_view = CTk.CTkFrame(self.main_container, fg_color="transparent")
-        self.queue_view.grid_rowconfigure(1, weight=1)
-        self.queue_view.grid_columnconfigure(0, weight=1)
-        
-        # Header
-        header = CTk.CTkFrame(self.queue_view, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        
-        title_lbl = CTk.CTkLabel(header, text="Download Progress Monitor", font=CTk.CTkFont(size=16, weight="bold"))
-        title_lbl.pack(side="left")
-        
-        self.queue_summary_lbl = CTk.CTkLabel(header, text="", font=CTk.CTkFont(size=12), text_color=COLOR_TEXT_MUTED)
-        self.queue_summary_lbl.pack(side="left", padx=15)
-        
-        self.pause_btn = CTk.CTkButton(header, text="Pause", width=80, fg_color="#ff9800", hover_color="#f57c00", text_color="black", command=self.toggle_pause)
-        self.pause_btn.pack(side="right", padx=5)
-        
-        cancel_btn = CTk.CTkButton(header, text="Cancel All", width=80, fg_color="#f44336", hover_color="#d32f2f", text_color="white", command=self.cancel_all_downloads)
-        cancel_btn.pack(side="right", padx=5)
-        
-        open_folder_btn = CTk.CTkButton(header, text="📁 Open Folder", width=105, fg_color=COLOR_FRAME_BG, hover_color="#333333", text_color="white", border_color="#555555", border_width=1, command=lambda: open_in_file_manager(self.config.download_directory))
-        open_folder_btn.pack(side="right", padx=5)
-
-        clear_btn = CTk.CTkButton(header, text="Clear Finished", width=100, fg_color=COLOR_FRAME_BG, hover_color="#333333", text_color="white", border_color=COLOR_ACCENT, border_width=1, command=self.clear_finished_downloads)
-        clear_btn.pack(side="right", padx=5)
-        
-        # Scroll area
-        self.queue_scroll = CTk.CTkScrollableFrame(self.queue_view, fg_color=COLOR_FRAME_BG)
-        self.queue_scroll.grid(row=1, column=0, sticky="nsew")
-
-    def update_queue_summary(self):
-        total = len(self.queue_items)
-        if total == 0:
-            self.queue_summary_lbl.configure(text="")
-            self._queue_was_active = False
+    async def load_and_set_specs(self, track_id, badge_label):
+        if not track_id or badge_label is None:
             return
-        completed = sum(1 for item in self.queue_items.values() if item["status"] == "completed")
-        failed = sum(1 for item in self.queue_items.values() if item["status"] == "failed")
-        pending = sum(1 for item in self.queue_items.values() if item["status"] in ["queued", "downloading"])
-        self.queue_summary_lbl.configure(text=f"Total: {total} | Completed: {completed} | Failed: {failed} | Pending: {pending}")
-
-        # Completion sound alert trigger
-        if getattr(self, "_queue_was_active", False) and pending == 0 and completed > 0:
-            self._queue_was_active = False
-            self.play_completion_alert()
-        elif pending > 0:
-            self._queue_was_active = True
-
-    def play_completion_alert(self):
-        """Plays a gentle notification sound when the entire download queue finishes."""
-        if not getattr(self.config, "play_sound_on_complete", True):
+        if track_id in self._specs_cache:
+            text, background, foreground = self._specs_cache[track_id]
+            self.after(0, self._apply_badge, badge_label, text, background, foreground)
             return
-            
-        def do_sound():
+        try:
+            specs = await self.api.get_track_specs(track_id)
+            if specs and specs.get("bit_depth"):
+                triple = format_specs(
+                    specs["bit_depth"],
+                    specs["sample_rate"],
+                    specs.get("audio_quality", ""),
+                    specs.get("audio_mode", "STEREO"),
+                )
+                self._specs_cache[track_id] = triple
+                self.after(0, self._apply_badge, badge_label, *triple)
+        except Exception:
+            pass
+
+    def _apply_badge(self, label, text, background, foreground):
+        try:
+            if label.winfo_exists():
+                label.configure(text=text, fg_color=background, text_color=foreground)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------- preview
+
+    def stop_preview(self):
+        self._preview_gen = getattr(self, "_preview_gen", 0) + 1
+        if winsound is not None:
             try:
-                import platform
-                if platform.system() == "Windows":
-                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                else:
-                    print("\a", end="", flush=True)
-            except Exception as e:
-                print(f"Completion sound failed: {e}")
-                
-        threading.Thread(target=do_sound, daemon=True).start()
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+        proc = getattr(self, "preview_proc", None)
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+            except Exception:
+                pass
+        self.preview_proc = None
+        button = getattr(self, "active_pbtn", None)
+        if button is not None:
+            try:
+                if button.winfo_exists():
+                    button.configure(text="▶")
+            except Exception:
+                pass
+        self.active_pbtn = None
+        self.preview_tid = None
 
-    def toggle_pause(self):
-        if self.downloader.is_paused:
-            self.downloader.is_paused = False
-            self.pause_btn.configure(text="Pause")
-        else:
-            self.downloader.is_paused = True
-            self.pause_btn.configure(text="Resume")
-            
-    def cancel_all_downloads(self):
-        if messagebox.askyesno("Cancel Downloads", "Are you sure you want to cancel all downloads?"):
-            self.downloader.is_cancelled = True
-            self.pending_downloads.clear()
-            
-            for tid in list(self.queue_items.keys()):
-                item = self.queue_items[tid]
-                if item["status"] in ["queued", "downloading"]:
-                    item["status"] = "cancelled"
-                    if item.get("task_state"):
-                        item["task_state"]["is_cancelled"] = True
-                    def safe_cancel(i=item):
-                        try:
-                            if i["status_lbl"].winfo_exists():
-                                i["status_lbl"].configure(text="Cancelled", text_color="#f44336")
-                            if i["progress_bar"].winfo_exists():
-                                i["progress_bar"].configure(progress_color="#f44336")
-                        except Exception:
-                            pass
-                    self.after(0, safe_cancel)
-            self.update_queue_summary()
-            self.after(1500, self._reset_cancel_flag)
-            
-    def _reset_cancel_flag(self):
-        self.downloader.is_cancelled = False
-        
-    def clear_finished_downloads(self):
-        """Removes completed, failed, and cancelled items from the UI queue."""
-        for tid in list(self.queue_items.keys()):
-            status = self.queue_items[tid]["status"]
-            if status in ["completed", "failed", "cancelled"]:
-                # Destroy the UI row
-                self.queue_items[tid]["row"].destroy()
-                # Remove from tracking dictionaries
-                del self.queue_items[tid]
-                if tid in self.queue_order:
-                    self.queue_order.remove(tid)
-        self.update_queue_summary()
-
-    def queue_track_download(self, track_id, title, parent_folder=None):
-        if track_id in self.queue_items:
-            messagebox.showinfo("Already Queued", f"'{title}' is already in the download queue.")
+    def toggle_preview(self, track_id, button):
+        if winsound is None:
+            messagebox.showinfo("Preview", "Audio preview is only available on Windows.")
             return
-            
-        # UI representation
-        row = CTk.CTkFrame(self.queue_scroll, fg_color="#252525", height=70)
-        row.pack(fill="x", pady=5, padx=5)
-        row.pack_propagate(False)
-        
-        lbl = CTk.CTkLabel(row, text=title, font=CTk.CTkFont(size=12, weight="bold"), anchor="w")
-        lbl.pack(side="top", fill="x", padx=15, pady=(5, 0))
-        
-        progress_frame = CTk.CTkFrame(row, fg_color="transparent")
-        progress_frame.pack(side="bottom", fill="x", padx=15, pady=(0, 10))
-        
-        # Control frame (packed to right FIRST so buttons and status text are never squished)
-        ctrl_frame = CTk.CTkFrame(progress_frame, fg_color="transparent")
-        ctrl_frame.pack(side="right")
+        self._preview_gen = getattr(self, "_preview_gen", 0) + 1
+        gen = self._preview_gen
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+        proc = getattr(self, "preview_proc", None)
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+            except Exception:
+                pass
+        self.preview_proc = None
+        if self.active_pbtn is not None and self.active_pbtn is not button:
+            try:
+                if self.active_pbtn.winfo_exists():
+                    self.active_pbtn.configure(text="▶")
+            except Exception:
+                pass
 
-        progress_bar = CTk.CTkProgressBar(progress_frame, fg_color="#444444", progress_color=COLOR_ACCENT)
-        progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 15))
-        progress_bar.set(0.0)
-        
-        lbl_frame = CTk.CTkFrame(ctrl_frame, width=280, height=20, fg_color="transparent")
-        lbl_frame.pack(side="left", padx=(0, 10))
-        lbl_frame.pack_propagate(False)
-        
-        status_lbl = CTk.CTkLabel(lbl_frame, text="Queued", font=CTk.CTkFont(family="Consolas", size=11), text_color=COLOR_TEXT_MUTED, anchor="w")
-        status_lbl.pack(side="left", fill="both", expand=True)
-        
-        pause_btn = CTk.CTkButton(ctrl_frame, text="⏸", width=25, height=20, fg_color="#ff9800", hover_color="#f57c00", text_color="black")
-        pause_btn.pack(side="left", padx=2)
-        
-        cancel_btn = CTk.CTkButton(ctrl_frame, text="✖", width=25, height=20, fg_color="#f44336", hover_color="#d32f2f", text_color="white")
-        cancel_btn.pack(side="left", padx=2)
-        
-        top_btn = CTk.CTkButton(ctrl_frame, text="⬆", width=25, height=20, fg_color="#4caf50", hover_color="#388e3c", text_color="white")
-        top_btn.pack(side="left", padx=2)
-        
-        task_state = {"is_paused": False, "is_cancelled": False}
-        
-        def toggle_item_pause():
-            if task_state["is_paused"]:
-                task_state["is_paused"] = False
-                pause_btn.configure(text="⏸")
+        if self.preview_tid == track_id:
+            self.preview_tid = None
+            self.active_pbtn = None
+            try:
+                button.configure(text="▶")
+            except Exception:
+                pass
+            return
+
+        self.preview_tid = track_id
+        self.active_pbtn = button
+        try:
+            button.configure(text="…")
+        except Exception:
+            pass
+        threading.Thread(
+            target=self._preview_worker,
+            args=(track_id, button, gen),
+            daemon=True,
+        ).start()
+
+    def _preview_worker(self, track_id, button, gen):
+        try:
+            preview_dir = os.path.join(self.config.config_dir, "previews")
+            os.makedirs(preview_dir, exist_ok=True)
+            tmp_m4a = os.path.join(preview_dir, f"preview_{track_id}.m4a")
+            tmp_wav = os.path.join(preview_dir, f"preview_{track_id}.wav")
+
+            if not (os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000):
+                async def fetch_audio():
+                    info = await self.api.get_stream_info(track_id, "LOW")
+                    session = await self.api.get_session()
+                    with open(tmp_m4a, "wb") as handle:
+                        if info["type"] == "direct":
+                            async with session.get(info["url"]) as response:
+                                handle.write(await response.content.read(1024 * 500))
+                        else:
+                            async with session.get(info["init_url"]) as response:
+                                handle.write(await response.read())
+                            for segment in info.get("segment_urls", [])[:3]:
+                                async with session.get(segment) as response:
+                                    handle.write(await response.read())
+
+                future = asyncio.run_coroutine_threadsafe(fetch_audio(), self.async_loop)
+                future.result(timeout=30)
+                if self._preview_gen != gen:
+                    return
+
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                self.preview_proc = subprocess.Popen(
+                    [ffmpeg_exe, "-y", "-i", tmp_m4a, "-f", "wav", tmp_wav],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.preview_proc.wait()
+                try:
+                    os.remove(tmp_m4a)
+                except OSError:
+                    pass
+
+            if self._preview_gen != gen:
+                return
+            if os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1000:
+                self.after(0, self._set_preview_button, button, "⏹")
+                winsound.PlaySound(tmp_wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
             else:
-                task_state["is_paused"] = True
-                pause_btn.configure(text="▶")
-                
-        def cancel_item():
-            task_state["is_cancelled"] = True
-            if self.queue_items[track_id]["status"] == "queued":
-                self.queue_items[track_id]["status"] = "cancelled"
-                status_lbl.configure(text="Cancelled", text_color="#f44336")
-                
-        def move_item_to_top():
-            if track_id in self.pending_downloads:
-                self.pending_downloads.remove(track_id)
-                self.pending_downloads.insert(0, track_id)
-                
-                if track_id in self.queue_order:
-                    self.queue_order.remove(track_id)
-                    insert_idx = len(self.queue_order)
-                    for i, tid in enumerate(self.queue_order):
-                        if self.queue_items[tid]["status"] == "queued":
-                            insert_idx = i
-                            break
-                    self.queue_order.insert(insert_idx, track_id)
-                    
-                    for tid in self.queue_order:
-                        item_row = self.queue_items.get(tid, {}).get("row")
-                        if item_row:
-                            item_row.pack_forget()
-                            item_row.pack(fill="x", pady=5, padx=5)
-                
-        pause_btn.configure(command=toggle_item_pause)
-        cancel_btn.configure(command=cancel_item)
-        top_btn.configure(command=move_item_to_top)
-        
-        def retry_item():
-            if self.queue_items[track_id]["status"] == "failed":
-                self.queue_items[track_id]["status"] = "queued"
-                status_lbl.configure(text="Queued", text_color=COLOR_TEXT_MUTED)
-                progress_bar.set(0.0)
-                progress_bar.configure(progress_color=COLOR_ACCENT)
-                task_state["is_paused"] = False
-                task_state["is_cancelled"] = False
-                pause_btn.configure(text="⏸", state="normal")
-                cancel_btn.configure(state="normal")
-                retry_btn.pack_forget()
-                self.pending_downloads.append(track_id)
-                self.update_queue_summary()
-                
-        retry_btn = CTk.CTkButton(ctrl_frame, text="🔁", width=25, height=20, fg_color="#2196f3", hover_color="#1976d2", text_color="white", command=retry_item)
-        
-        open_btn = CTk.CTkButton(
-            ctrl_frame,
-            text="📁",
-            width=26,
-            height=20,
-            fg_color=COLOR_FRAME_BG,
-            hover_color="#333333",
-            text_color="white",
-            border_color="#555555",
-            border_width=1
-        )
+                self.after(0, self._set_preview_button, button, "▶")
+        except Exception as exc:
+            print(f"Preview error: {exc}")
+            self.after(0, self._set_preview_button, button, "▶")
 
-        self.queue_items[track_id] = {
-            "row": row,
-            "progress_bar": progress_bar,
-            "status_lbl": status_lbl,
-            "pause_btn": pause_btn,
-            "cancel_btn": cancel_btn,
-            "top_btn": top_btn,
-            "retry_btn": retry_btn,
-            "open_btn": open_btn,
-            "final_path": None,
-            "title": title,
-            "status": "queued",
-            "parent_folder": parent_folder,
-            "task_state": task_state
-        }
-        self.queue_order.append(track_id)
-        self.pending_downloads.append(track_id)
-        self._queue_was_active = True
-        self.update_queue_summary()
-            
-        # Switch to Queue tab to see progress
-        self.switch_view("queue")
-
-    def queue_album_downloads(self, album_id, album_title):
-        self.run_async(self.fetch_and_queue_album(album_id, album_title))
-
-    async def fetch_and_queue_album(self, album_id, album_title):
+    def _set_preview_button(self, button, text):
         try:
-            tracks_resp = await self.api.get_album_tracks(album_id)
-            items = tracks_resp.get("items", [])
-            if not items:
-                raise Exception("No tracks found on this album.")
-                
-            formatted_tracks = []
-            for item in items:
-                track_id = item["id"]
-                artists = item.get("artists", [])
-                artist_name = artists[0]["name"] if artists else (item.get("artist") or {}).get("name", "Unknown Artist")
-                dur = item.get("duration", 0)
-                dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else ""
-                formatted_tracks.append({
-                    "id": track_id,
-                    "title": item.get("title", "Unknown Title"),
-                    "artist": artist_name,
-                    "track_num": item.get("trackNumber", len(formatted_tracks) + 1),
-                    "disc_num": item.get("volumeNumber", 1),
-                    "duration_str": dur_str,
-                })
-                
-            def open_dialog():
-                TrackSelectionModal(
-                    parent=self,
-                    collection_type="Album",
-                    collection_title=album_title,
-                    track_list=formatted_tracks,
-                    on_confirm_callback=lambda sel: self.on_tracks_selected_for_download(sel, album_title, is_playlist=False)
+            if button.winfo_exists():
+                button.configure(text=text)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------- session lifecycle
+
+    def on_closing_save_session(self):
+        self._shutdown = True
+        try:
+            entries = []
+            for key in self.queue_order:
+                item = self.queue_items.get(key)
+                if not item:
+                    continue
+                if item.get("status") not in ("queued", "downloading"):
+                    continue
+                entries.append(
+                    {
+                        "task": item.get("task"),
+                        "title": item.get("title"),
+                        "subtitle": item.get("subtitle"),
+                    }
                 )
-            self.after(0, open_dialog)
-        except Exception as e:
-            err_msg = str(e)
-            self.after(0, lambda: messagebox.showerror("Album Error", f"Failed to retrieve album tracks: {err_msg}"))
+            session_file = os.path.join(self.config.config_dir, "session.json")
+            os.makedirs(self.config.config_dir, exist_ok=True)
+            with open(session_file, "w", encoding="utf-8") as handle:
+                json.dump(entries, handle, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"Failed to save session: {exc}")
 
-    def queue_playlist_downloads(self, playlist_id, playlist_title):
-        self.run_async(self.fetch_and_queue_playlist(playlist_id, playlist_title))
+        self.stop_preview()
+        self._cleanup_preview_files()
+        if hasattr(self, "player_shutdown"):
+            self.player_shutdown()
 
-    async def fetch_and_queue_playlist(self, playlist_id, playlist_title):
+    def _cleanup_preview_files(self):
+        preview_dir = os.path.join(self.config.config_dir, "previews")
+        for pattern in ("preview_*.m4a", "preview_*.wav"):
+            try:
+                for path in glob.glob(os.path.join(preview_dir, pattern)):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+    def on_closing(self):
+        if self._closing:
+            return
+        self._closing = True
+        self.on_closing_save_session()
+        self.downloader.is_cancelled = True
         try:
-            items = await self.api.get_playlist_tracks(playlist_id)
-            if not items:
-                raise Exception("No tracks found in this playlist.")
-                
-            formatted_tracks = []
-            for idx, item in enumerate(items):
-                track_info = item.get("item") if "item" in item else item
-                if track_info and ("id" in track_info):
-                    track_id = track_info["id"]
-                    artists = track_info.get("artists", [])
-                    artist_name = artists[0]["name"] if artists else (track_info.get("artist") or {}).get("name", "Unknown Artist")
-                    dur = track_info.get("duration", 0)
-                    dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else ""
-                    formatted_tracks.append({
-                        "id": track_id,
-                        "title": track_info.get("title", "Unknown Title"),
-                        "artist": artist_name,
-                        "track_num": idx + 1,
-                        "disc_num": track_info.get("volumeNumber", 1),
-                        "duration_str": dur_str,
-                    })
-                    
-            def open_dialog():
-                TrackSelectionModal(
-                    parent=self,
-                    collection_type="Playlist",
-                    collection_title=playlist_title,
-                    track_list=formatted_tracks,
-                    on_confirm_callback=lambda sel: self.on_tracks_selected_for_download(sel, playlist_title, is_playlist=True)
-                )
-            self.after(0, open_dialog)
-        except Exception as e:
-            err_msg = str(e)
-            self.after(0, lambda: messagebox.showerror("Playlist Error", f"Failed to retrieve playlist tracks: {err_msg}"))
+            self.destroy()
+        except Exception:
+            pass
 
-    def on_tracks_selected_for_download(self, selected_tracks, collection_title=None, is_playlist=False):
-        """Queues chosen tracks from the selection dialog and switches to the queue monitor view."""
-        if not selected_tracks:
+    def load_session(self):
+        session_file = os.path.join(self.config.config_dir, "session.json")
+        if not os.path.exists(session_file):
             return
-            
-        for trk in selected_tracks:
-            track_id = trk["id"]
-            artist_name = trk.get("artist", "Unknown Artist")
-            title = f"{trk.get('title', 'Unknown Title')} - {artist_name}"
-            parent_folder = collection_title if is_playlist else None
-            self.queue_track_download(track_id, title, parent_folder=parent_folder)
-            
-        self.switch_view("queue")
-
-    async def download_worker(self):
-        max_c = getattr(self.config, 'concurrent_downloads', 3)
-        sem = asyncio.Semaphore(max_c)
-        async def worker_task(tid):
-            async with sem:
-                if self.queue_items[tid]['status'] == 'cancelled' or self.queue_items[tid]['task_state']['is_cancelled']:
-                    return
-                await self.process_single_download(tid)
-        while not self.downloader.is_cancelled:
-            if not self.pending_downloads:
-                await asyncio.sleep(0.5)
-                continue
-            track_id = self.pending_downloads.pop(0)
-            asyncio.create_task(worker_task(track_id))
-
-    async def process_single_download(self, tid):
-        """Processes a single download task."""
-        self.queue_items[tid]["status"] = "downloading"
-        
-        def make_callback(tid):
-            last_ui_time = 0.0
-            async def progress_update(downloaded, total, status_text):
-                nonlocal last_ui_time
-                now = time.time()
-                # Performance patch: throttle GUI redraws to at most 4x/sec unless 0% or 100%
-                if (now - last_ui_time < 0.25) and (0 < downloaded < total):
-                    return
-                last_ui_time = now
-                progress = float(downloaded) / max(1.0, float(total))
-                def safe_update():
-                    try:
-                        if tid in self.queue_items:
-                            pb = self.queue_items[tid].get("progress_bar")
-                            sl = self.queue_items[tid].get("status_lbl")
-                            if pb and pb.winfo_exists():
-                                pb.set(progress)
-                            if sl and sl.winfo_exists():
-                                sl.configure(text=status_text)
-                    except Exception:
-                        pass
-                self.after(0, safe_update)
-            return progress_update
-            
         try:
-            parent_folder = self.queue_items[tid].get("parent_folder")
-            task_state = self.queue_items[tid].get("task_state")
-            res = await self.downloader.download_track(tid, make_callback(tid), parent_folder, task_state)
-            if tid in self.queue_items:
-                self.queue_items[tid]["status"] = "completed"
-                final_path = res.get("final_path") if isinstance(res, dict) else str(res)
-                self.queue_items[tid]["final_path"] = final_path
-                spec_text = res.get("spec_str", "") if isinstance(res, dict) else ""
-                completed_msg = f"Completed{spec_text}" if spec_text else "Completed"
-                
-                def safe_complete(nid=tid, msg=completed_msg, fpath=final_path):
-                    try:
-                        if nid in self.queue_items:
-                            pb = self.queue_items[nid].get("progress_bar")
-                            sl = self.queue_items[nid].get("status_lbl")
-                            ob = self.queue_items[nid].get("open_btn")
-                            pause_b = self.queue_items[nid].get("pause_btn")
-                            cancel_b = self.queue_items[nid].get("cancel_btn")
-                            top_b = self.queue_items[nid].get("top_btn")
-                            
-                            if pb and pb.winfo_exists():
-                                pb.configure(progress_color="#4caf50")
-                            if sl and sl.winfo_exists():
-                                sl.configure(text=msg)
-                                
-                            # Hide pause/cancel/top buttons since download is done
-                            if pause_b and pause_b.winfo_exists():
-                                pause_b.pack_forget()
-                            if cancel_b and cancel_b.winfo_exists():
-                                cancel_b.pack_forget()
-                            if top_b and top_b.winfo_exists():
-                                top_b.pack_forget()
-                                
-                            # Show Open in Explorer button
-                            if ob and ob.winfo_exists() and fpath:
-                                ob.configure(command=lambda p=fpath: open_in_file_manager(p, select_file=True))
-                                ob.pack(side="left", padx=2)
-                    except Exception:
-                        pass
-                self.after(0, safe_complete)
-                self.after(0, self.update_queue_summary)
-        except Exception as e:
-            print(f"Download failed for track {tid}: {e}")
-            if tid in self.queue_items:
-                self.queue_items[tid]["status"] = "failed"
-                def safe_failed(nid=tid):
-                    try:
-                        if nid in self.queue_items:
-                            pb = self.queue_items[nid].get("progress_bar")
-                            sl = self.queue_items[nid].get("status_lbl")
-                            rb = self.queue_items[nid].get("retry_btn")
-                            if pb and pb.winfo_exists():
-                                pb.configure(progress_color="#f44336")
-                            if sl and sl.winfo_exists():
-                                sl.configure(text="Failed", text_color="#f44336")
-                            if rb and rb.winfo_exists():
-                                rb.pack(side="left", padx=2)
-                    except Exception:
-                        pass
-                self.after(0, safe_failed)
-                self.after(0, self.update_queue_summary)
-
-    # --- Settings View ---
-
-    def create_settings_view(self):
-        self.settings_view = CTk.CTkFrame(self.main_container, fg_color="transparent")
-        self.settings_view.grid_columnconfigure(0, weight=1)
-        
-        # Title
-        title_lbl = CTk.CTkLabel(self.settings_view, text="System Configurations", font=CTk.CTkFont(size=18, weight="bold"), text_color=COLOR_ACCENT)
-        title_lbl.pack(anchor="w", pady=(0, 20))
-        
-        # 1. Output Folder Location
-        folder_lbl = CTk.CTkLabel(self.settings_view, text="Download Directory Location", font=CTk.CTkFont(size=13, weight="bold"))
-        folder_lbl.pack(anchor="w", pady=(5, 5))
-        
-        folder_frame = CTk.CTkFrame(self.settings_view, fg_color="transparent")
-        folder_frame.pack(fill="x", pady=(0, 15))
-        folder_frame.grid_columnconfigure(0, weight=1)
-        
-        self.folder_entry = CTk.CTkEntry(folder_frame, height=35)
-        self.folder_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        self.folder_entry.insert(0, self.config.download_directory)
-        
-        browse_btn = CTk.CTkButton(folder_frame, text="Browse", fg_color=COLOR_FRAME_BG, hover_color="#333333", border_color=COLOR_ACCENT, border_width=1, width=100, height=35, command=self.browse_directory)
-        browse_btn.grid(row=0, column=1)
-        
-        # 2. Quality Tier Selection
-        quality_lbl = CTk.CTkLabel(self.settings_view, text="Preferred Stream Quality Tier", font=CTk.CTkFont(size=13, weight="bold"))
-        quality_lbl.pack(anchor="w", pady=(5, 5))
-        
-        # Mapping UI names to internal values
-        self.quality_map = {
-            "Max (Hi-Res Lossless FLAC)": "HI_RES_LOSSLESS",
-            "HiFi (CD-Quality Lossless FLAC)": "LOSSLESS",
-            "High (320kbps AAC)": "HIGH",
-            "Low (96kbps AAC)": "LOW"
-        }
-        self.quality_reverse_map = {v: k for k, v in self.quality_map.items()}
-        
-        self.quality_menu = CTk.CTkOptionMenu(
-            self.settings_view,
-            values=list(self.quality_map.keys()),
-            width=300,
-            height=35,
-            fg_color=COLOR_FRAME_BG,
-            button_color=COLOR_FRAME_BG,
-            button_hover_color="#333333",
-            dropdown_fg_color=COLOR_FRAME_BG
-        )
-        self.quality_menu.pack(anchor="w", pady=(0, 20))
-        
-        current_quality_str = self.quality_reverse_map.get(self.config.quality_tier, "HiFi (CD-Quality Lossless FLAC)")
-        self.quality_menu.set(current_quality_str)
-        
-        # Atmos Selection
-        atmos_lbl = CTk.CTkLabel(self.settings_view, text="Allow Dolby Atmos (Immersive Audio)", font=CTk.CTkFont(size=13, weight="bold"))
-        atmos_lbl.pack(anchor="w", pady=(5, 5))
-        
-        self.atmos_switch = CTk.CTkSwitch(self.settings_view, text="Enable Dolby Atmos streams if available", progress_color=COLOR_ACCENT)
-        self.atmos_switch.pack(anchor="w", pady=(0, 20))
-        if self.config.allow_dolby_atmos:
-            self.atmos_switch.select()
-        else:
-            self.atmos_switch.deselect()
-
-        # Sound Alert Selection
-        sound_lbl = CTk.CTkLabel(self.settings_view, text="Queue Completion Audio Alert", font=CTk.CTkFont(size=13, weight="bold"))
-        sound_lbl.pack(anchor="w", pady=(5, 5))
-        
-        self.sound_switch = CTk.CTkSwitch(self.settings_view, text="Play audio chime when all queue downloads finish", progress_color=COLOR_ACCENT)
-        self.sound_switch.pack(anchor="w", pady=(0, 20))
-        if getattr(self.config, "play_sound_on_complete", True):
-            self.sound_switch.select()
-        else:
-            self.sound_switch.deselect()
-        lbl_t = CTk.CTkLabel(self.settings_view, text='File Naming Template', font=CTk.CTkFont(size=13, weight='bold'))
-        lbl_t.pack(anchor="w", pady=(5, 5))
-        self.template_entry = CTk.CTkEntry(self.settings_view, width=300, height=35)
-        self.template_entry.pack(anchor="w", pady=(0, 20))
-        self.template_entry.insert(0, getattr(self.config, 'file_template', '{album}/{track_num} - {title}.{ext}'))
-        lbl_c = CTk.CTkLabel(self.settings_view, text='Concurrent Downloads (1-3)', font=CTk.CTkFont(size=13, weight='bold'))
-        lbl_c.pack(anchor="w", pady=(5, 5))
-        slider_frame = CTk.CTkFrame(self.settings_view, fg_color="transparent")
-        slider_frame.pack(anchor="w", pady=(0, 20))
-        self.concurrent_slider = CTk.CTkSlider(slider_frame, from_=1, to=3, number_of_steps=2, width=250)
-        self.concurrent_slider.pack(side="left")
-        self.concurrent_value_lbl = CTk.CTkLabel(slider_frame, text=str(int(getattr(self.config, 'concurrent_downloads', 3))), font=CTk.CTkFont(size=14, weight="bold"), text_color=COLOR_ACCENT, width=30)
-        self.concurrent_value_lbl.pack(side="left", padx=10)
-        self.concurrent_slider.configure(command=lambda v: self.concurrent_value_lbl.configure(text=str(int(v))))
-        self.concurrent_slider.set(getattr(self.config, 'concurrent_downloads', 3))
-        
-        # Browser Selection
-        browser_lbl = CTk.CTkLabel(self.settings_view, text="Login Browser Selection", font=CTk.CTkFont(size=13, weight="bold"))
-        browser_lbl.pack(anchor="w", pady=(5, 5))
-        
-        self.browser_options = ["Default Browser", "Google Chrome", "Mozilla Firefox", "Microsoft Edge", "Safari", "Opera"]
-        self.browser_menu = CTk.CTkOptionMenu(
-            self.settings_view,
-            values=self.browser_options,
-            width=300,
-            height=35,
-            fg_color=COLOR_FRAME_BG,
-            button_color=COLOR_FRAME_BG,
-            button_hover_color="#333333",
-            dropdown_fg_color=COLOR_FRAME_BG
-        )
-        self.browser_menu.pack(anchor="w", pady=(0, 20))
-        self.browser_menu.set(self.config.login_browser)
-        
-        # 3. Custom API Keys
-        key_lbl = CTk.CTkLabel(self.settings_view, text="Custom API Credentials Override (Advanced)", font=CTk.CTkFont(size=13, weight="bold"))
-        key_lbl.pack(anchor="w", pady=(5, 5))
-        
-        self.client_id_entry = CTk.CTkEntry(self.settings_view, placeholder_text="Client ID", height=35)
-        self.client_id_entry.pack(fill="x", pady=(0, 10))
-        self.client_id_entry.insert(0, self.config.client_id)
-        
-        self.client_secret_entry = CTk.CTkEntry(self.settings_view, placeholder_text="Client Secret (Optional)", height=35)
-        self.client_secret_entry.pack(fill="x", pady=(0, 25))
-        self.client_secret_entry.insert(0, self.config.client_secret)
-        
-        # Action Buttons
-        actions_frame = CTk.CTkFrame(self.settings_view, fg_color="transparent")
-        actions_frame.pack(fill="x")
-        
-        save_btn = CTk.CTkButton(actions_frame, text="Save Settings", fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="black", height=40, font=CTk.CTkFont(size=13, weight="bold"), command=self.save_settings)
-        save_btn.pack(side="left", padx=(0, 15))
-        
-        reset_btn = CTk.CTkButton(actions_frame, text="Reset Keys to Default", fg_color=COLOR_FRAME_BG, hover_color="#333333", text_color="white", height=40, command=self.reset_keys)
-        reset_btn.pack(side="left")
-
-    def browse_directory(self):
-        selected = filedialog.askdirectory(initialdir=self.folder_entry.get())
-        if selected:
-            self.folder_entry.delete(0, "end")
-            self.folder_entry.insert(0, selected)
-
-    def save_settings(self):
-        new_dir = self.folder_entry.get().strip()
-        new_quality = self.quality_map.get(self.quality_menu.get(), "LOSSLESS")
-        new_browser = self.browser_menu.get()
-        new_atmos = bool(self.atmos_switch.get())
-        new_concurrent = int(self.concurrent_slider.get())
-        new_template = self.template_entry.get().strip()
-        new_id = self.client_id_entry.get().strip()
-        new_secret = self.client_secret_entry.get().strip()
-        
-        if not new_dir:
-            messagebox.showerror("Error", "Download directory cannot be empty.")
+            with open(session_file, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            print(f"Failed to read session: {exc}")
+            try:
+                os.remove(session_file)
+            except OSError:
+                pass
             return
-        if not new_id:
-            messagebox.showerror("Error", "Client ID cannot be empty.")
-            return
-            
-        # Update config properties
-        self.config.download_directory = new_dir
-        self.config.quality_tier = new_quality
-        self.config.login_browser = new_browser
-        self.config.allow_dolby_atmos = new_atmos
-        self.config.play_sound_on_complete = bool(self.sound_switch.get())
-        self.config.concurrent_downloads = new_concurrent
-        self.config.file_template = new_template
-        
-        # Check if keys changed
-        keys_changed = (self.config.client_id != new_id or self.config.client_secret != new_secret)
-        self.config.client_id = new_id
-        self.config.client_secret = new_secret
-        
-        self.config.save()
-        
-        if keys_changed:
-            self.config.clear_session()
-            self.update_login_display(False)
-            messagebox.showinfo("Settings Saved", "Settings successfully saved!\nSince API keys were updated, your active login session was cleared. Please log in again.")
-        else:
-            messagebox.showinfo("Settings Saved", "Settings successfully saved!")
 
-    def reset_keys(self):
-        self.client_id_entry.delete(0, "end")
-        self.client_id_entry.insert(0, self.config.DEFAULT_CLIENT_ID)
-        self.client_secret_entry.delete(0, "end")
-        self.client_secret_entry.insert(0, self.config.DEFAULT_CLIENT_SECRET)
+        restored = 0
+        try:
+            for entry in data or []:
+                if not isinstance(entry, dict):
+                    continue
+                task = entry.get("task")
+                if isinstance(task, dict) and task.get("source"):
+                    self.queue_task(
+                        dict(task),
+                        title=entry.get("title"),
+                        subtitle=entry.get("subtitle"),
+                        switch=False,
+                    )
+                    restored += 1
+                elif entry.get("track_id"):
+                    migrated = {
+                        "source": "tidal",
+                        "track_id": entry["track_id"],
+                        "parent_folder": entry.get("parent_folder"),
+                        "meta": {
+                            "title": entry.get("title") or "Unknown title",
+                            "artist": "",
+                            "album": "",
+                        },
+                    }
+                    self.queue_task(
+                        migrated,
+                        title=entry.get("title") or "Unknown title",
+                        subtitle="Tidal · restored from last session",
+                        switch=False,
+                    )
+                    restored += 1
+        finally:
+            try:
+                os.remove(session_file)
+            except OSError:
+                pass
+
+        if restored:
+            self.switch_view("queue")
+            messagebox.showinfo(
+                "Queue restored",
+                f"Restored {restored} unfinished download(s) from your last session.",
+            )

@@ -1,7 +1,7 @@
 <div align="center">
   
-# 🌊 Tdl-music-downloader
-**The Ultimate Audiophile Music Downloader**
+# 🌊 TDL Music — Tidal & YouTube
+**The Ultimate Audiophile Music Downloader & Player**
 
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg?style=for-the-badge&logo=python)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-success.svg?style=for-the-badge)](LICENSE)
@@ -9,7 +9,9 @@
 [![Audio: Hi-Res FLAC](https://img.shields.io/badge/Audio-24--bit%20FLAC-ffb300.svg?style=for-the-badge)](https://en.wikipedia.org/wiki/FLAC)
 [![Audio: Dolby Atmos](https://img.shields.io/badge/Audio-Dolby%20Atmos-9c27b0.svg?style=for-the-badge)](https://www.dolby.com/technologies/dolby-atmos/)
 
-A sleek, lightning-fast, and open-source HiFi music downloader built for audiophiles who demand true, bit-perfect studio quality. Say goodbye to low-bitrate MP3s and hello to pristine **24-bit/192kHz Studio Masters**.
+A sleek, lightning-fast, and open-source HiFi music downloader built for audiophiles who demand true, bit-perfect studio quality. Download **24-bit/192kHz studio masters from Tidal**, save **any YouTube track as a tagged MP3**, and play everything back inside the app — with the real audio format shown for every file.
+
+> **Based on the original project:** [Fthzx20/tdl-music-downloader](https://github.com/Fthzx20/tdl-music-downloader) by [@Fthzx20](https://github.com/Fthzx20). This extended edition adds the white/blue UI, YouTube MP3 downloads, the built-in player with format badges, and the Windows one-click launcher.
 
 [Features](#-superpowers--features) • [External Link Support](#-multi-platform-link-search) • [Installation](#-installation) • [How to Use](#-how-to-use) • [Configuration](#-configuration)
 
@@ -19,19 +21,22 @@ A sleek, lightning-fast, and open-source HiFi music downloader built for audioph
 
 ## ⚡ Superpowers & Features
 
-* 🎧 **True Hi-Res Studio Masters**: Bit-perfect extraction up to **24-bit/192kHz FLAC** directly from the source—no upscaling, no transcoding, pure studio sound.
-* 🔗 **Multi-Platform Link Search & Mobile Shortlinks**: Paste links directly from **Spotify**, **Apple Music**, **YouTube / YouTube Music**, **Deezer**, **SoundCloud**, **Amazon Music**, **Qobuz**, and **Bandcamp** (with automatic HTTP 301/302 redirect following for mobile shortlinks like `spotify.link`, `spoti.fi`, `apple.co`, `deezer.page.link`, etc.)!
+* 🎨 **Modern White & Blue Interface**: Clean, professional light theme with a top navbar source selector, circular download progress rings, and a four-tab workspace (Search, Queue, Player, Settings).
+* 🎧 **True Hi-Res Studio Masters**: Bit-perfect extraction up to **24-bit/192kHz FLAC** directly from Tidal—no upscaling, no transcoding, pure studio sound.
+* ▶️ **YouTube to MP3**: Search YouTube or paste a video/playlist link; audio is converted to MP3 (up to 320 kbps) with cover art and ID3 tags.
+* 🎵 **Built-in Music Player with Real Format Badges**: Play your downloaded library inside the app and see the actual codec and quality of every file — `FLAC · 24-bit / 96 kHz`, `MP3 · 320 kbps / 44.1 kHz`, `WAV · 16-bit / 44.1 kHz`, and more.
+* 🔗 **Multi-Platform Link Search & Mobile Shortlinks**: Paste links from **Apple Music**, **YouTube / YouTube Music**, **Deezer**, **SoundCloud**, **Amazon Music**, **Qobuz**, and **Bandcamp** into Tidal search (with automatic HTTP 301/302 redirect following for mobile shortlinks like `apple.co`, `deezer.page.link`, `a.co`).
 * 🔍 **Intelligent Smart Search Engine**: Built-in diacritics & accent normalization (`Björk` ↔ `Bjork`, `Rosalía` ↔ `Rosalia`), query permutations (`Artist - Title` ↔ `Title Artist`), and cross-category fallbacks (track-to-album recovery).
-* 🎵 **Dynamic Real Specs Badge**: Real-time color-coded badges that reflect true bit-depth and sample rates (`MAX • 24-bit/192kHz`, `MAX • 24-bit/96kHz`, `HiFi • 16-bit/44.1kHz`, etc.), 100% verified against acoustic spectrum analyzers like **Spek**.
+* 🎵 **Dynamic Real Specs Badge**: Real-time color-coded badges that reflect true bit-depth and sample rates (`MAX • 24-bit/192kHz`, `MAX • 24-bit/96kHz`, `HiFi • 16-bit/44.1kHz`, etc.), verified against acoustic spectrum analyzers like **Spek**.
 * 🔊 **Dolby Atmos Toggle & Smart Fallback**: Toggle spatial Dolby Atmos on or off in Settings. When off, the engine automatically selects the **highest available stereo tier** (MAX 24-bit FLAC or HiFi 16-bit FLAC).
-* ▶️ **Instant In-App Audio Preview**: Click the preview button (▶) on any search result to listen to a 30-second audio preview before downloading, powered by low-latency Windows native audio with race-condition protection.
+* ▶️ **Instant In-App Audio Preview**: Click the preview button (▶) on any Tidal search result to listen to a 30-second audio preview before downloading.
 * 🎤 **Karaoke-Ready Synchronized Lyrics**: Automatically extracts synced lyrics, saves standard `.lrc` files alongside your music, and embeds lyrics tags into the audio metadata (`UNSYNCEDLYRICS` for FLAC, `©lyr` for M4A).
 * 📁 **Custom File Naming Templates**: Organize your library your way with customizable path templates (e.g. `{artist}/{album}/{track_num} - {title}.{ext}`).
 * 🎚️ **Adjustable Concurrent Downloads**: Configure 1 to 3 simultaneous download slots with real-time UI control and async semaphore gating.
 * ⏭️ **Smart Sync Skip**: Automatically checks your library before downloading and skips tracks that already exist, saving time and bandwidth.
 * 🧑‍🎤 **Artist Discography Browser**: Click "View Albums" on any artist search result to instantly view and download their complete discography.
 * ☑️ **Interactive Track Selection Checklist**: When downloading an Album or Playlist, an interactive modal dialog lets you pick individual tracks with Select All, Deselect All, and Invert controls—download only the tracks you want.
-* 🗂️ **Quick Explorer File & Folder Access**: One-click "Open Folder" button in Queue header plus individual folder buttons (📁) next to completed tracks to immediately reveal files in Windows Explorer.
+* 🗂️ **Quick Explorer File & Folder Access**: One-click "Open Folder" button in the Queue header plus per-track actions to play the file or reveal it in Windows Explorer.
 * 🔔 **Queue Completion Audio Alert**: Gentle Windows chime alert when all batch downloads complete, with toggle switch in Settings.
 * 🛡️ **HTTP 429 Armor & Auto-Retry**: Built-in exponential backoff and connection retry safeguards your downloads against network drops and rate limits.
 * 🧠 **Session Preservation**: Pending download queues are automatically remembered and restored if the application is closed.
@@ -41,11 +46,11 @@ A sleek, lightning-fast, and open-source HiFi music downloader built for audioph
 
 ## 🔗 Multi-Platform Link Search
 
-Paste any streaming link directly into the search bar and press **Enter**:
+Paste any streaming link directly into the **Tidal** search bar and press **Enter**:
 
 | Platform | Supported Formats | Example / Shortlink |
 | :--- | :--- | :--- |
-| **Spotify** | Tracks, Albums, Playlists, Artists, URIs, Shortlinks | `https://open.spotify.com/track/...`, `spotify.link/...` |
+| **Tidal** | Direct Track, Album, Playlist, Artist links & UUIDs | `https://tidal.com/browse/track/...` |
 | **Apple Music** | Tracks (`?i=...`), Albums, Playlists, Artists, Shortlinks | `https://music.apple.com/.../album/...`, `apple.co/...` |
 | **YouTube Music** | Tracks, Music Videos, Playlists, Shortlinks | `https://music.youtube.com/watch?v=...`, `youtu.be/...` |
 | **Deezer** | Tracks, Albums, Playlists, Artists, Shortlinks | `https://www.deezer.com/track/...`, `deezer.page.link/...` |
@@ -53,7 +58,9 @@ Paste any streaming link directly into the search bar and press **Enter**:
 | **Amazon Music** | Tracks, Albums, Playlists, Shortlinks | `https://music.amazon.com/albums/...`, `a.co/...` |
 | **Qobuz** | Tracks, Albums, Playlists, Interpreters | `https://open.qobuz.com/track/...` |
 | **Bandcamp** | Tracks, Albums | `https://artist.bandcamp.com/track/...` |
-| **Tidal** | Direct Track, Album, Playlist, Artist links & UUIDs | `https://tidal.com/browse/track/...` |
+
+> Tip: For YouTube downloads, switch the navbar source to **YouTube** and paste a video or playlist link directly.
+
 
 ---
 
@@ -68,10 +75,12 @@ Paste any streaming link directly into the search bar and press **Enter**:
 
 ## 🚀 Installation
 
+> **Windows users:** after cloning, simply double-click **`run.bat`**. It creates the virtual environment, installs all dependencies on first run, and opens the app without a console window. The manual steps below are for other platforms or custom setups.
+
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/Fthzx20/tdl-music-downloader.git
-   cd tdl-music-downloader
+   git clone https://github.com/RaafiHafidzRamadhan/tdl-music-downloader-extended.git
+   cd tdl-music-downloader-extended
    ```
 
 2. **Create a virtual environment (Recommended):**
@@ -97,18 +106,34 @@ Paste any streaming link directly into the search bar and press **Enter**:
    ```bash
    python main.py
    ```
+   **Windows shortcut:** double-click `run.bat`. On first run it creates the virtual environment and installs dependencies automatically, then opens the app without a console window.
 
 2. **Login:**
    - Click the **Login** button in the sidebar.
    - Enter the displayed verification code in the browser window that opens to link your account.
 
-3. **Search & Download:**
-   - Search by **Keywords**, **Tidal link**, or paste links from **Spotify / Apple Music / YouTube / Deezer**.
+3. **Choose a source:**
+   - Use the **Tidal / YouTube** selector in the top navbar.
+   - **Tidal**: search by keywords or paste a Tidal or external music link.
+   - **YouTube**: search by keywords or paste a video / playlist link.
+
+4. **Download from Tidal:**
+   - Click **Login** in the sidebar and enter the verification code shown in your browser.
    - Click **▶** to preview any song.
    - Click **Download** to queue tracks, full albums, or playlists.
 
-4. **Monitor Queue:**
-   - Switch to the **Queue Monitor** tab to see real-time progress, retry failed downloads, bump tracks to top, or review exact downloaded specifications (e.g. `Completed (24-bit/176.4kHz FLAC)`).
+5. **Download from YouTube:**
+   - Switch the navbar source to **YouTube**.
+   - Search or paste a link, then queue the video or playlist.
+   - Audio is converted to MP3 (bitrate configurable in Settings) with cover art and tags.
+
+6. **Play your music:**
+   - Open the **Player** tab to browse the download folder.
+   - Every track shows its real format, e.g. `FLAC · 24-bit / 96 kHz` or `MP3 · 320 kbps / 44.1 kHz`.
+   - Use the queue's **Play** button on a completed download to jump straight into the player.
+
+7. **Monitor Queue:**
+   - Switch to the **Queue** tab to see circular real-time progress, retry failed downloads, bump tracks to top, or review exact downloaded specifications (e.g. `Completed (24-bit/176.4kHz FLAC)`).
 
 ---
 
@@ -116,12 +141,22 @@ Paste any streaming link directly into the search bar and press **Enter**:
 
 Open the **Settings** tab in the sidebar to configure:
 
-* 📁 **Download Directory:** Set where your music files are saved.
+* 📁 **Download Directory:** Set where Tidal downloads, YouTube MP3s, and the player library are stored. The same folder is used by every source.
 * 🎚️ **Preferred Quality Tier:** `Max (Hi-Res Lossless FLAC)`, `HiFi (16-bit FLAC)`, `High (320kbps AAC)`, or `Low (96kbps AAC)`.
+* 🎧 **YouTube MP3 Bitrate:** Choose `128`, `192`, `256`, or `320 kbps` for YouTube conversions.
 * 🔊 **Allow Dolby Atmos:** Toggle spatial audio downloads on/off (Default: **OFF**, automatically falls back to MAX/HiFi stereo FLAC).
-* 📝 **File Naming Template:** Customize file paths using `{artist}`, `{album}`, `{track_num}`, `{title}`, `{ext}` tags.
+* 📝 **File Naming Template:** Customize Tidal file paths using `{artist}`, `{album}`, `{track_num}`, `{title}`, `{ext}` tags.
 * ⚡ **Concurrent Downloads:** Slider to control simultaneous download threads (1 to 3).
-* 🌐 **Login Browser:** Select your preferred browser for OAuth authorization.
+* 🌐 **Login Browser:** Select your preferred browser for Tidal OAuth authorization.
+
+---
+
+## 🙌 Credits & Attribution
+
+- **Original project:** [tdl-music-downloader](https://github.com/Fthzx20/tdl-music-downloader) by [**Fthzx20**](https://github.com/Fthzx20) — the original Tidal downloader foundation and implementation.
+- **Extended edition:** [RaafiHafidzRamadhan/tdl-music-downloader-extended](https://github.com/RaafiHafidzRamadhan/tdl-music-downloader-extended) — white/blue UI redesign, YouTube MP3 source, built-in player with real audio format badges, and Windows launcher.
+
+All credit for the original implementation goes to Fthzx20 and the original contributors. This repository keeps the original MIT license and builds on top of their work.
 
 ---
 

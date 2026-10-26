@@ -44,6 +44,7 @@ class Config:
         self.play_sound_on_complete = True
         self.concurrent_downloads = 3
         self.file_template = "{album}/{track_num} - {title}.{ext}"
+        self.mp3_bitrate = "320"
         
         self.load()
 
@@ -83,6 +84,7 @@ class Config:
             self.play_sound_on_complete = data.get("play_sound_on_complete", True)
             self.concurrent_downloads = data.get("concurrent_downloads", 3)
             self.file_template = data.get("file_template", "{album}/{track_num} - {title}.{ext}")
+            self.mp3_bitrate = str(data.get("mp3_bitrate", "320"))
         except Exception as e:
             print(f"Error loading configuration: {e}")
 
@@ -103,7 +105,8 @@ class Config:
             "allow_dolby_atmos": self.allow_dolby_atmos,
             "play_sound_on_complete": self.play_sound_on_complete,
             "concurrent_downloads": self.concurrent_downloads,
-            "file_template": self.file_template
+            "file_template": self.file_template,
+            "mp3_bitrate": self.mp3_bitrate
         }
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
